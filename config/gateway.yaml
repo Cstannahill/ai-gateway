@@ -1,0 +1,132 @@
+# AI Gateway — Example Configuration
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Place this file at config/gateway.yaml or pass the path as the first
+# CLI argument: ai-gateway path/to/config.yaml
+
+server:
+  host: "0.0.0.0"
+  port: 8999
+  body_limit_bytes: 52428800  # 50 MB
+  shutdown_timeout_secs: 30
+
+# ─── Providers ──────────────────────────────────────────────────────────────
+# Each provider has a name, type, base URL, and optional API key.
+
+providers:
+  llama:
+    name: llama
+    type: llama_cpp
+    base_url: "http://localhost:8080"
+    timeout_secs: 300
+
+  openrouter:
+    name: openrouter
+    type: open_router
+    base_url: "https://openrouter.ai/api"
+    api_key_env: OPENROUTER_API_KEY
+    timeout_secs: 120
+
+  ollama:
+    name: ollama
+    type: ollama
+    base_url: "http://localhost:11434"
+    timeout_secs: 300
+
+  # ollama-cloud:
+  #   name: ollama-cloud
+  #   type: ollama
+  #   base_url: "https://your-ollama-cloud-endpoint"
+  #   api_key_env: OLLAMA_CLOUD_API_KEY
+
+  # vllm:
+  #   name: vllm
+  #   type: vllm
+  #   base_url: "http://localhost:8000"
+  #   timeout_secs: 300
+
+  # google:
+  #   name: google
+  #   type: gemini
+  #   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+  #   api_key_env: GOOGLE_AI_API_KEY
+
+  # huggingface:
+  #   name: huggingface
+  #   type: hugging_face
+  #   base_url: "https://api-inference.huggingface.co"
+  #   api_key_env: HF_API_KEY
+
+# ─── Models ─────────────────────────────────────────────────────────────────
+# Each model is an alias that maps to one or more provider/model candidates.
+# Candidates are tried in priority order (lower = higher priority).
+
+models:
+  coding-fast:
+    name: coding-fast
+    description: "Fast coding model — prefers local inference"
+    candidates:
+      - provider: llama
+        model: qwen3.5-9b
+        priority: 1
+      - provider: openrouter
+        model: qwen/qwen3.5-35b
+        priority: 2
+    capabilities:
+      tools: true
+      streaming: true
+      structured_output: true
+
+  coding-strong:
+    name: coding-strong
+    description: "Strong coding model — cloud frontier"
+    candidates:
+      - provider: openrouter
+        model: anthropic/claude-sonnet-4
+        priority: 1
+    capabilities:
+      tools: true
+      vision: true
+      reasoning: true
+      streaming: true
+      structured_output: true
+
+  general:
+    name: general
+    description: "General purpose model"
+    candidates:
+      - provider: llama
+        model: qwen3.5-9b
+        priority: 1
+      - provider: ollama
+        model: qwen3.5:9b
+        priority: 2
+      - provider: openrouter
+        model: google/gemini-2.5-flash
+        priority: 3
+    capabilities:
+      tools: true
+      streaming: true
+
+# ─── Routing ────────────────────────────────────────────────────────────────
+
+routing:
+  default_policy: ordered
+  max_retries_per_provider: 2
+  fallback_on:
+    - timeout
+    - rate_limit
+    - unavailable
+    - server_error
+  attempt_timeout_secs: 120
+
+# ─── Telemetry ──────────────────────────────────────────────────────────────
+
+telemetry:
+  enabled: true
+  database_url_env: DATABASE_URL
+  pool_size: 10
+  batch_size: 100
+  flush_interval_ms: 1000
+  store_raw_bodies: true
+  store_stream_events: true
