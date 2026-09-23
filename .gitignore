@@ -1,1 +1,4 @@
 /target
+.env
+DEV_PROFILE*.md
+.developer_profile_analysis.md
