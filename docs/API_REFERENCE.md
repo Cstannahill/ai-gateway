@@ -20,6 +20,7 @@ The **AI Gateway** exposes an OpenAI-compatible HTTP API alongside native monito
 | [`/v1/analytics/requests/{request_id}/timeline`](#10-get-v1analyticsrequestsrequest_idtimeline) | `GET` | Chunk-level stream timeline | JSON |
 | [`/v1/analytics/providers/comparison`](#11-get-v1analyticsproviderscomparison) | `GET` | Cross-provider TTFT/TPS/success-rate comparison | JSON |
 | [`/v1/analytics/fallbacks`](#12-get-v1analyticsfallbacks) | `GET` | Fallback frequency & root cause | JSON |
+| [`/v1/analytics/costs`](#13-get-v1analyticscosts) | `GET` | Estimated cost summary & pricing coverage | JSON |
 
 ---
 
@@ -363,6 +364,8 @@ Returns the operational status, health, and current load for each registered pro
 
 Read-only query API over the telemetry schema (docs/REMEDIATION_PLAN.md Phase 4 item 1). Every `/v1/analytics/*` endpoint requires a reachable `DATABASE_URL` — if the gateway started without one (or couldn't connect at startup), every endpoint in this section returns `503 analytics_unavailable` instead of an empty/misleading result.
 
+`docs/frontend/API_GAPS.md` is a frontend-driven gap analysis of this API (written against the dashboard's actual needs) and tracks known remaining limitations — some closed since it was written (see docs/REMEDIATION_PLAN.md's latest status block for which), some still open. Read it before assuming a field this section doesn't mention is simply missing by oversight; several are deliberate, documented scope boundaries (e.g. no bucketed time series yet, no keyset pagination yet, no usage-observation finality model yet).
+
 Lists recorded requests, newest first.
 
 ### Query Parameters
@@ -437,7 +440,7 @@ The chunk-level stream timeline for a request, ordered by attempt and sequence �
 
 ## 11. GET `/v1/analytics/providers/comparison`
 
-Per-provider/model aggregate stats: total and successful attempt counts, average latency, average tokens/sec, and average TTFT. Every timing average excludes attempts where `synthetic_timing = true` (non-streaming reconstructions) so real streaming performance isn't diluted by fabricated near-zero latencies.
+Per-provider/model aggregate stats: attempt volume/success, average latency, average tokens/sec, and TTFT (mean + p50/p95) — each average carries its own sample count. Every timing average excludes attempts where `synthetic_timing = true` (non-streaming reconstructions) so real streaming performance isn't diluted by fabricated near-zero latencies. A canonical (most-recently-observed) usage row is selected per attempt before joining, so an attempt with more than one `UsageRecorded` update is never counted more than once. TTFT is measured from `provider_attempts.timestamp` and deliberately includes failed attempts that still produced a first-token marker — it's a dispatch/reachability signal, not a success-only metric.
 
 ### Response
 ```json
@@ -449,8 +452,14 @@ Per-provider/model aggregate stats: total and successful attempt counts, average
       "total_attempts": 120,
       "successful_attempts": 116,
       "avg_duration_ms": 842.1,
+      "duration_sample_count": 116,
       "avg_tokens_per_sec": 38.7,
-      "avg_ttft_ms": 210.4
+      "throughput_sample_count": 110,
+      "avg_ttft_ms": 210.4,
+      "p50_ttft_ms": 195.0,
+      "p95_ttft_ms": 340.2,
+      "ttft_sample_count": 118,
+      "synthetic_attempts": 4
     }
   ]
 }
@@ -460,7 +469,7 @@ Per-provider/model aggregate stats: total and successful attempt counts, average
 
 ## 12. GET `/v1/analytics/fallbacks`
 
-Fallback frequency and root cause: for each request that ultimately succeeded after at least one failed attempt, which provider(s) failed and why. Capped at the 200 most recent such requests.
+Fallback frequency and root cause: for each of the most recent successful requests that had at least one non-success attempt along the way, the *full ordered attempt chain* (not just the failures) so the whole recovery sequence — same-provider retry, model switch, or provider switch — is reconstructable. The 200-row cap applies to distinct requests, not joined attempt rows; `truncated: true` means older recovered requests exist beyond this sample.
 
 ### Response
 ```json
@@ -469,10 +478,63 @@ Fallback frequency and root cause: for each request that ultimately succeeded af
     {
       "request_id": "01921a4f-5b68-7182-938b-829d10e01234",
       "succeeded_provider": "openrouter",
-      "failed_provider": "llama",
-      "failed_model": "qwen2.5-coder:7b",
-      "error_code": "server_error",
-      "error_message": "upstream 503"
+      "attempts": [
+        {
+          "attempt_number": 1,
+          "timestamp": "2026-09-23T03:26:29.507Z",
+          "provider": "llama",
+          "model": "qwen2.5-coder:7b",
+          "status": "failed",
+          "error_code": "server_error",
+          "error_message": "upstream 503"
+        },
+        {
+          "attempt_number": 2,
+          "timestamp": "2026-09-23T03:26:29.612Z",
+          "provider": "openrouter",
+          "model": "qwen2.5-coder:7b",
+          "status": "success",
+          "error_code": null,
+          "error_message": null
+        }
+      ]
+    }
+  ],
+  "sample_scope": "up to 200 most recent successful requests with at least one non-success attempt, ordered by received_at DESC",
+  "truncated": false
+}
+```
+
+---
+
+## 13. GET `/v1/analytics/costs`
+
+Cost summary: total estimated charge, pricing coverage, and a per-provider/model breakdown, computed from `cost_records` (itself populated only when `config.pricing` has an entry for a given `"provider/model"` deployment — see `docs/CONFIGURATION_GUIDE.md`). A missing price yields an *unpriced* attempt, not a zero-cost one; an explicitly configured zero price is priced. `billed_cost` is always `null` — this is an estimate from configured prices, never an actual provider invoice.
+
+### Query Parameters
+| Parameter | Type | Description |
+|:---|:---|:---|
+| `provider` | string | Filter to one provider (exact match). |
+| `model` | string | Filter to one model (exact match). |
+
+### Response
+```json
+{
+  "currency": "USD",
+  "estimated_token_charge": 2.00,
+  "billed_cost": null,
+  "priced_attempts": 1,
+  "unpriced_attempts": 1,
+  "eligible_attempts": 2,
+  "pricing_source": "config/gateway.yaml `pricing` table (static, unversioned per-deployment $/1K-token prices)",
+  "breakdowns": [
+    {
+      "provider": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet",
+      "priced_attempts": 1,
+      "estimated_cost": 2.00,
+      "input_cost": 1.00,
+      "output_cost": 1.00
     }
   ]
 }

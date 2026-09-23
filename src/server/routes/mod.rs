@@ -45,4 +45,5 @@ pub fn analytics_routes() -> Router<Arc<AppState>> {
         )
         .route("/v1/analytics/providers/comparison", get(analytics::provider_comparison))
         .route("/v1/analytics/fallbacks", get(analytics::fallback_analysis))
+        .route("/v1/analytics/costs", get(analytics::cost_summary))
 }
