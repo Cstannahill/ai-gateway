@@ -40,6 +40,14 @@ pub enum ProviderEvent {
         headers: HashMap<String, String>,
     },
 
+    /// First byte of the response body received — distinct from `Connected`
+    /// (which, for this adapter, is timestamped when headers arrive) and
+    /// useful on its own for local/slow-to-start providers where there can
+    /// be a real gap between headers and the first body byte (e.g. prompt
+    /// processing time before a local LLM starts streaming). Emitted at
+    /// most once per attempt. See docs/REMEDIATION_PLAN.md Phase 3.1.
+    FirstByte { timestamp: DateTime<Utc> },
+
     /// A delta of reasoning/thinking content.
     ReasoningDelta {
         timestamp: DateTime<Utc>,
@@ -86,6 +94,14 @@ pub enum ProviderEvent {
         provider_response_id: Option<String>,
         /// Upstream provider info (e.g. DeepInfra behind OpenRouter).
         upstream_provider: Option<String>,
+        /// The full raw provider response body, when a single body exists
+        /// (non-streaming requests, where it's decoded in full before this
+        /// event is constructed). `None` for real SSE streams, which have
+        /// no single response body to preserve — previously this was
+        /// always discarded even when available, so `store_raw_bodies`
+        /// silently had no effect on this path (docs/REMEDIATION_PLAN.md
+        /// Phase 3.6 / Audit A05).
+        raw_response: Option<serde_json::Value>,
     },
 
     /// An error occurred during execution.
@@ -131,6 +147,7 @@ impl ProviderEvent {
             Self::Started { timestamp, .. }
             | Self::Connected { timestamp, .. }
             | Self::ResponseHeaders { timestamp, .. }
+            | Self::FirstByte { timestamp, .. }
             | Self::ReasoningDelta { timestamp, .. }
             | Self::ContentDelta { timestamp, .. }
             | Self::ToolCallDelta { timestamp, .. }

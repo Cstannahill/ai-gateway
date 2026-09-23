@@ -7,7 +7,7 @@
 [![Language](https://img.shields.io/badge/language-Rust_2024-orange.svg)](https://www.rust-lang.org/)
 [![Framework](https://img.shields.io/badge/framework-Axum_0.8-blue.svg)](https://github.com/tokio-rs/axum)
 [![Database](https://img.shields.io/badge/database-PostgreSQL_16-blue.svg)](https://www.postgresql.org/)
-[![Tests](https://img.shields.io/badge/tests-21%2F21_passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-58%2F58_passed-brightgreen.svg)]()
 [![Warnings](https://img.shields.io/badge/warnings-0-brightgreen.svg)]()
 
 </div>
@@ -73,7 +73,7 @@ graph TD
 ## Quickstart
 
 ### 1. Prerequisites
-- **Rust Toolchain**: 1.85+ (Edition 2024).
+- **Rust Toolchain**: 1.88+ (Edition 2024; the codebase uses let-chain syntax stabilized in 1.88 — an older toolchain will fail to compile despite the Edition 2024 minimum implying 1.85).
 - **PostgreSQL** *(Optional)*: Required for persistent telemetry and dataset generation.
 
 ### 2. Configuration
@@ -214,9 +214,14 @@ cargo check --all-targets
 ### Test Results
 - `unittests src/lib.rs`: **PASSED**
 - `unittests src/main.rs`: **PASSED**
-- `tests/api_tests.rs`: **PASSED** (5/5)
-- `tests/routing_tests.rs`: **PASSED** (5/5)
+- `tests/api_tests.rs`: **PASSED** (6/6)
+- `tests/audit_contract_tests.rs`: **PASSED** (14/14, 1 ignored — requires a live disposable PostgreSQL instance; see the file's own doc comment)
+- `tests/bugfix_tests.rs`: **PASSED** (7/7)
+- `tests/config_validation_tests.rs`: **PASSED** (12/12)
 - `tests/fallback_tests.rs`: **PASSED** (3/3)
 - `tests/provider_options_tests.rs`: **PASSED** (3/3)
-- `tests/sse_tests.rs`: **PASSED** (5/5)
+- `tests/routing_tests.rs`: **PASSED** (6/6)
+- `tests/sse_tests.rs`: **PASSED** (7/7)
 - **Compiler Warnings**: **0 warnings** across all crates and tests.
+
+See [`docs/INIT_CONVERSATION_AUDIT.md`](docs/INIT_CONVERSATION_AUDIT.md), [`docs/INIT_CONVERSATION_AUDIT_CLAUDE.md`](docs/INIT_CONVERSATION_AUDIT_CLAUDE.md), and [`docs/REMEDIATION_PLAN.md`](docs/REMEDIATION_PLAN.md) for a detailed, code-verified account of what is and isn't yet implemented — passing tests confirm the behavior they cover, not full API compatibility.

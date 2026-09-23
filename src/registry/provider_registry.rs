@@ -26,8 +26,13 @@ struct ProviderRuntimeState {
     active_requests: u32,
     total_requests: u64,
     total_errors: u64,
+    /// Inference-attempt latency only — see `record_latency`'s doc comment.
     total_latency_ms: u64,
     latency_samples: u64,
+    /// Background health-probe latency only — see
+    /// `record_health_check_latency`'s doc comment.
+    total_health_check_latency_ms: u64,
+    health_check_latency_samples: u64,
 }
 
 impl Default for ProviderRegistry {
@@ -61,6 +66,8 @@ impl ProviderRegistry {
                 total_errors: 0,
                 total_latency_ms: 0,
                 latency_samples: 0,
+                total_health_check_latency_ms: 0,
+                health_check_latency_samples: 0,
             },
         );
         self.providers.insert(name, adapter);
@@ -91,6 +98,22 @@ impl ProviderRegistry {
             .get(name)
             .map(|s| s.config.enabled && s.health != ProviderHealth::Unhealthy)
             .unwrap_or(false)
+    }
+
+    /// Check if a provider is registered and administratively enabled,
+    /// ignoring health status.
+    ///
+    /// Used by explicit-addressing routing short-circuits: explicit
+    /// provider/model selection intentionally bypasses capability/priority
+    /// filtering (that's the point of explicit addressing — reproducibility),
+    /// but it must not bypass an operator's `enabled: false`, which is an
+    /// administrative kill switch, not a routing preference. Health is
+    /// deliberately excluded here — a caller who explicitly names a
+    /// provider may know it's fine even if the periodic health probe
+    /// hasn't caught up yet. See docs/REMEDIATION_PLAN.md Phase 1.4 /
+    /// Audit A11.
+    pub fn is_enabled(&self, name: &str) -> bool {
+        self.state.get(name).map(|s| s.config.enabled).unwrap_or(false)
     }
 
     /// Get the current health of a provider.
@@ -127,11 +150,26 @@ impl ProviderRegistry {
         }
     }
 
-    /// Record request latency for a provider.
+    /// Record *inference* attempt latency for a provider — feeds
+    /// `lowest_latency` routing and `/metrics`/`/providers` avg_latency_ms.
+    /// Do not call this from the background health-check worker; use
+    /// `record_health_check_latency` for that (Audit A13).
     pub fn record_latency(&self, name: &str, latency_ms: u64) {
         if let Some(mut state) = self.state.get_mut(name) {
             state.total_latency_ms += latency_ms;
             state.latency_samples += 1;
+        }
+    }
+
+    /// Record background health-probe latency for a provider. Kept in a
+    /// separate rolling average from `record_latency` so periodic
+    /// `/models` health checks never influence routing decisions or the
+    /// reported inference-latency metric (docs/REMEDIATION_PLAN.md
+    /// Phase 3.3 / Audit A13).
+    pub fn record_health_check_latency(&self, name: &str, latency_ms: u64) {
+        if let Some(mut state) = self.state.get_mut(name) {
+            state.total_health_check_latency_ms += latency_ms;
+            state.health_check_latency_samples += 1;
         }
     }
 
@@ -146,6 +184,11 @@ impl ProviderRegistry {
                 } else {
                     None
                 };
+                let avg_health_check_latency = if s.health_check_latency_samples > 0 {
+                    Some(s.total_health_check_latency_ms as f64 / s.health_check_latency_samples as f64)
+                } else {
+                    None
+                };
 
                 ProviderStatus {
                     name: entry.key().clone(),
@@ -156,6 +199,7 @@ impl ProviderRegistry {
                     total_requests: s.total_requests,
                     total_errors: s.total_errors,
                     avg_latency_ms: avg_latency,
+                    avg_health_check_latency_ms: avg_health_check_latency,
                 }
             })
             .collect()

@@ -37,6 +37,13 @@ pub enum TelemetryEvent {
     RequestReceived {
         request_id: Uuid,
         timestamp: DateTime<Utc>,
+        /// Opaque client-supplied correlation ID (e.g. an inbound
+        /// `x-request-id` header), preserved for tracing/idempotency.
+        /// This is NOT the database primary key — `request_id` is always
+        /// gateway-generated so that a client reusing a correlation ID
+        /// across distinct requests cannot overwrite another request's
+        /// stored data. See docs/REMEDIATION_PLAN.md Phase 0.4.
+        client_correlation_id: Option<String>,
         /// The requesting application (from metadata).
         application: Option<String>,
         /// The task label (from metadata).
@@ -87,6 +94,15 @@ pub enum TelemetryEvent {
         request_id: Uuid,
         attempt_number: u32,
         timestamp: DateTime<Utc>,
+        /// True when this timing was fabricated for a non-streaming
+        /// response reconstructed into events after the fact (all such
+        /// events land within microseconds of each other, since the whole
+        /// response arrived in one HTTP round-trip) rather than observed
+        /// from a genuine live stream. Analytical TTFB/TTFT/inter-chunk
+        /// queries should exclude `synthetic = true` rows — averaging them
+        /// in would silently understate real streaming latency
+        /// (docs/REMEDIATION_PLAN.md Phase 3.1 / Audit A06).
+        synthetic: bool,
     },
 
     /// First generation chunk received (TTFT).
@@ -95,6 +111,8 @@ pub enum TelemetryEvent {
         attempt_number: u32,
         timestamp: DateTime<Utc>,
         content_preview: Option<String>,
+        /// See `FirstProviderByte::synthetic`.
+        synthetic: bool,
     },
 
     /// A stream chunk event (for timeline reconstruction).
@@ -105,6 +123,8 @@ pub enum TelemetryEvent {
         sequence: u64,
         chunk_type: String,
         byte_count: u32,
+        /// See `FirstProviderByte::synthetic`.
+        synthetic: bool,
     },
 
     /// A provider attempt completed.
@@ -156,6 +176,30 @@ pub enum TelemetryEvent {
         currency: String,
     },
 
+    /// Point-in-time snapshot of a model alias's configuration — the
+    /// `model_snapshots` table existed with no writer at all (Audit A15);
+    /// this gives future attempts/generations a provenance record to
+    /// reference even after the live config changes.
+    ModelSnapshot {
+        timestamp: DateTime<Utc>,
+        model_name: String,
+        providers: Vec<String>,
+        capabilities: serde_json::Value,
+    },
+
+    /// Point-in-time snapshot of a provider's configuration and counters —
+    /// same rationale as `ModelSnapshot`, for the `provider_snapshots`
+    /// table.
+    ProviderSnapshot {
+        timestamp: DateTime<Utc>,
+        provider_name: String,
+        provider_type: String,
+        health: String,
+        total_requests: u64,
+        total_errors: u64,
+        avg_latency_ms: Option<f64>,
+    },
+
     /// The overall request completed (client stream closed).
     RequestCompleted {
         request_id: Uuid,
@@ -200,10 +244,15 @@ impl TelemetryEvent {
             Self::GenerationContent { .. } => "generation_content",
             Self::CostRecorded { .. } => "cost_recorded",
             Self::RequestCompleted { .. } => "request_completed",
+            Self::ModelSnapshot { .. } => "model_snapshot",
+            Self::ProviderSnapshot { .. } => "provider_snapshot",
         }
     }
 
-    /// Get the request ID this event belongs to.
+    /// Get the request ID this event belongs to. `ModelSnapshot` and
+    /// `ProviderSnapshot` aren't tied to any single request — they return
+    /// `Uuid::nil()` as an explicit "not applicable" sentinel rather than a
+    /// real request ID.
     pub fn request_id(&self) -> Uuid {
         match self {
             Self::RequestReceived { request_id, .. }
@@ -218,6 +267,7 @@ impl TelemetryEvent {
             | Self::GenerationContent { request_id, .. }
             | Self::CostRecorded { request_id, .. }
             | Self::RequestCompleted { request_id, .. } => *request_id,
+            Self::ModelSnapshot { .. } | Self::ProviderSnapshot { .. } => Uuid::nil(),
         }
     }
 }

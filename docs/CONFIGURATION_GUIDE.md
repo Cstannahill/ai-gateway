@@ -102,7 +102,7 @@ providers:
   huggingface:
     name: "huggingface"
     type: "hugging_face"
-    base_url: "https://api-inference.huggingface.co"
+    base_url: "https://router.huggingface.co/v1"
     api_key_env: "HF_API_KEY"
     timeout_secs: 120
 
@@ -210,6 +210,26 @@ telemetry:
 
   # Store individual SSE chunk receipt timestamps for inter-chunk jitter tracking
   store_stream_events: true
+
+  # Path to an append-only JSONL file used as a last-resort durability
+  # backstop when a telemetry batch fails to persist after all retries
+  # (default: "telemetry_fallback.jsonl" in the working directory). Not a
+  # full durable outbox with replay — just prevents an outage from silently
+  # discarding data.
+  fallback_log_path: "telemetry_fallback.jsonl"
+
+
+# ─── 6. Deployment Pricing (optional) ────────────────────────────────────────
+# Enables cost_records: keyed by "provider/model" (matching a ModelCandidate's
+# provider/model fields). A deployment with no entry here simply produces no
+# cost_records row for its generations — never a fabricated zero cost.
+pricing:
+  "llama/qwen3.5-9b":
+    input_cost_per_1k: 0.0    # local inference — no per-token cost
+    output_cost_per_1k: 0.0
+  "openrouter/anthropic/claude-3.7-sonnet":
+    input_cost_per_1k: 0.003
+    output_cost_per_1k: 0.015
 ```
 
 ---

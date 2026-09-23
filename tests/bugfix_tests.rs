@@ -174,6 +174,8 @@ async fn test_models_endpoint_namespacing() {
         router,
         telemetry_tx,
         start_time: Instant::now(),
+        total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        analytics_pool: None,
     });
 
     let app = build_router(state);
@@ -244,4 +246,70 @@ fn test_non_streaming_tool_calls_and_reasoning_extraction() {
     assert_eq!(tool_calls[0]["id"], "call_tokyo_123");
     assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
     assert_eq!(tool_calls[0]["function"]["arguments"], "{\"city\":\"Tokyo\"}");
+}
+
+#[test]
+fn test_multi_choice_non_streaming_response_yields_all_choices() {
+    // `n > 1` previously only ever surfaced `choices[0]`; the others were
+    // silently dropped (Audit A08 / docs/REMEDIATION_PLAN.md Phase 2.3).
+    use ai_gateway::providers::events::ProviderEvent;
+
+    let response_body = serde_json::json!({
+        "id": "chatcmpl-multi",
+        "choices": [
+            {
+                "index": 0,
+                "message": { "role": "assistant", "content": "first answer" },
+                "finish_reason": "stop"
+            },
+            {
+                "index": 1,
+                "message": { "role": "assistant", "content": "second answer" },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18 }
+    });
+
+    let events = OpenAICompatibleAdapter::events_from_non_streaming_response(
+        &response_body,
+        chrono::Utc::now(),
+        "test-provider".to_string(),
+        "test-model".to_string(),
+    );
+
+    let content_deltas: Vec<(u32, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::ContentDelta { index, delta, .. } => Some((*index, delta.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        content_deltas,
+        vec![(0, "first answer".to_string()), (1, "second answer".to_string())]
+    );
+}
+
+#[test]
+fn test_stop_accepts_string_or_array() {
+    // OpenAI's Chat Completions API allows `stop` to be a single string or
+    // an array of strings; a bare string previously failed to deserialize
+    // at all (Audit A08).
+    let single: GatewayRequest =
+        serde_json::from_value(serde_json::json!({"model": "m", "stop": "\n\n"})).unwrap();
+    assert_eq!(single.stop, Some(vec!["\n\n".to_string()]));
+
+    let many: GatewayRequest =
+        serde_json::from_value(serde_json::json!({"model": "m", "stop": ["a", "b"]})).unwrap();
+    assert_eq!(many.stop, Some(vec!["a".to_string(), "b".to_string()]));
+
+    let absent: GatewayRequest =
+        serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+    assert_eq!(absent.stop, None);
+
+    let null: GatewayRequest =
+        serde_json::from_value(serde_json::json!({"model": "m", "stop": null})).unwrap();
+    assert_eq!(null.stop, None);
 }

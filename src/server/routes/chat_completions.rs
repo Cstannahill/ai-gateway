@@ -12,18 +12,21 @@ use crate::providers::ProviderOutput;
 use crate::providers::events::ProviderEvent;
 use crate::routing::fallback;
 use crate::server::AppState;
-use crate::telemetry::events::TelemetryEvent;
+use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
 use crate::telemetry::stream_instrumentation::InstrumentedStream;
 use crate::types::request::GatewayRequest;
 
-struct StreamGuard {
-    state: Arc<AppState>,
-    provider: String,
-    model: String,
-    request_id: Uuid,
-    received_at: chrono::DateTime<Utc>,
-    attempt_number: u32,
-    completed: std::sync::atomic::AtomicBool,
+// `pub(crate)` so `responses.rs` can reuse it for its own SSE streaming
+// path instead of duplicating the same active-request/latency/
+// RequestCompleted bookkeeping (docs/REMEDIATION_PLAN.md Phase 2.2).
+pub(crate) struct StreamGuard {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) request_id: Uuid,
+    pub(crate) received_at: chrono::DateTime<Utc>,
+    pub(crate) attempt_number: u32,
+    pub(crate) completed: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for StreamGuard {
@@ -31,6 +34,14 @@ impl Drop for StreamGuard {
         let was_completed = self.completed.load(std::sync::atomic::Ordering::Relaxed);
         self.state.provider_registry.record_request_end(&self.provider, !was_completed);
         let duration_us = (Utc::now() - self.received_at).num_microseconds().unwrap_or(0) as u64;
+        if was_completed {
+            // Previously the streaming (SSE) success path never fed
+            // `lowest_latency` routing or `/metrics` inference latency at
+            // all — only health checks and embeddings did (Audit A13).
+            self.state
+                .provider_registry
+                .record_latency(&self.provider, duration_us / 1000);
+        }
         self.state.emit_telemetry(TelemetryEvent::RequestCompleted {
             request_id: self.request_id,
             timestamp: Utc::now(),
@@ -50,15 +61,47 @@ impl Drop for StreamGuard {
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Json(mut request): Json<GatewayRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
-    if let Some(header_id) = headers
+    state.record_gateway_request();
+
+    // Parse into a raw `Value` first and keep it verbatim for telemetry,
+    // then deserialize the canonical `GatewayRequest` from that same value.
+    // Previously the body was deserialized directly via the `Json<T>`
+    // extractor and the *typed* struct was re-serialized as "raw_request" —
+    // any field not in `GatewayRequest` (e.g. a client testing a new
+    // provider-side field) was silently erased before it ever reached
+    // storage (Audit A05).
+    let raw_value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid JSON body: {e}"),
+            );
+        }
+    };
+    let request: GatewayRequest = match serde_json::from_value(raw_value.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid request: {e}"),
+            );
+        }
+    };
+
+    // `request_id` is always gateway-generated (see GatewayRequest's default)
+    // and is never overwritten by a client-supplied header — an inbound
+    // `x-request-id` is preserved only as an opaque correlation ID, never as
+    // the database primary key, so a client reusing an ID across distinct
+    // requests cannot overwrite another request's stored data.
+    let client_correlation_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        request.request_id = header_id;
-    }
+        .map(|s| s.to_string());
     let request_id = request.request_id;
     let received_at = Utc::now();
     let uses_vision = state.router.requires_vision(&request);
@@ -67,13 +110,14 @@ pub async fn handle(
     state.emit_telemetry(TelemetryEvent::RequestReceived {
         request_id,
         timestamp: received_at,
+        client_correlation_id,
         application: request.metadata.as_ref().and_then(|m| m.application.clone()),
         task: request.metadata.as_ref().and_then(|m| m.task.clone()),
         tags: request.metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
         requested_model: request.model.clone(),
         streaming: request.stream,
         canonical_messages: request.messages.as_ref().and_then(|m| serde_json::to_value(m).ok()),
-        raw_request: serde_json::to_value(&request).ok(),
+        raw_request: Some(raw_value),
         uses_tools: request.tools.is_some(),
         uses_vision,
         uses_structured_output: request.response_format.is_some(),
@@ -97,11 +141,35 @@ pub async fn handle(
     };
 
     // ─── Emit: RouteSelected ─────────────────────────────────────────────
+    // Emitted even when routing found zero viable candidates, so "why
+    // nothing was selected" is always persisted (docs/REMEDIATION_PLAN.md
+    // Phase 1.4 / Audit CL02).
     state.emit_telemetry(TelemetryEvent::RouteSelected {
         request_id,
         timestamp: Utc::now(),
         decision: routing_plan.decision.clone(),
     });
+
+    if routing_plan.candidates.is_empty() {
+        state.emit_telemetry(TelemetryEvent::RequestCompleted {
+            request_id,
+            timestamp: Utc::now(),
+            total_latency_us: (Utc::now() - received_at).num_microseconds().unwrap_or(0) as u64,
+            total_attempts: 0,
+            serving_provider: None,
+            resolved_model: None,
+            success: false,
+        });
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "routing_error",
+            &format!(
+                "No compatible providers available for model '{}': {} candidate(s) rejected",
+                request.model,
+                routing_plan.decision.candidates_rejected
+            ),
+        );
+    }
 
     // ─── Build Retry / Fallback Configuration ────────────────────────────
     let retry_config = fallback::RetryConfig {
@@ -140,18 +208,40 @@ pub async fn handle(
             attempt_number += 1;
             state.provider_registry.record_request_start(&candidate.provider);
 
+            // Emitted before calling the provider, so connection failures,
+            // HTTP errors, and timeouts — none of which ever reach
+            // InstrumentedStream — still produce a recorded attempt
+            // (Audit A03). This is now the sole emitter of
+            // ProviderAttemptStarted; InstrumentedStream no longer emits it
+            // for the streaming path to avoid double-recording the same
+            // attempt.
+            let attempt_started_at = Utc::now();
+            state.emit_telemetry(TelemetryEvent::ProviderAttemptStarted {
+                request_id,
+                attempt_number,
+                timestamp: attempt_started_at,
+                provider: candidate.provider.clone(),
+                model: candidate.model.clone(),
+            });
+
             let attempt_timeout = std::time::Duration::from_secs(state.config.routing.attempt_timeout_secs.max(1));
             let exec_result = tokio::time::timeout(attempt_timeout, provider.execute(&request, &candidate.model)).await;
 
             match exec_result {
                 Ok(Ok(ProviderOutput::Stream(stream))) => {
-                    // Wrap in instrumented stream.
+                    // Wrap in instrumented stream. `!request.stream` means
+                    // the adapter took its non-streaming branch and handed
+                    // back a one-shot sequence of events reconstructed from
+                    // a single HTTP response, not a genuine live stream —
+                    // timing derived from it is fabricated (see
+                    // `InstrumentedStream`'s `synthetic` field doc).
                     let instrumented = InstrumentedStream::new(
                         stream,
                         request_id,
                         attempt_number,
                         state.telemetry_tx.clone(),
                         state.config.telemetry.store_stream_events,
+                        !request.stream,
                     );
 
                     if request.stream {
@@ -177,6 +267,13 @@ pub async fn handle(
                                 let model_str = candidate_model.clone();
                                 let guard = guard_for_events.clone();
                                 async move {
+                                    // Only a genuine `Completed` event marks
+                                    // this attempt as successful — the
+                                    // `[DONE]` sentinel below is always sent
+                                    // (clients need it to terminate the SSE
+                                    // stream) but must not itself flip
+                                    // `success` to true after a mid-stream
+                                    // error (Audit A04).
                                     if matches!(&event, ProviderEvent::Completed { .. }) {
                                         guard.completed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
@@ -186,7 +283,12 @@ pub async fn handle(
                                 }
                             })
                             .chain(futures::stream::once(async move {
-                                guard_for_done.completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                // Keep the guard alive through the final
+                                // chunk; its Drop impl (which emits
+                                // RequestCompleted) reads whatever
+                                // `completed` was actually set to above —
+                                // sending [DONE] no longer forces it true.
+                                drop(guard_for_done);
                                 Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
                             }));
 
@@ -194,10 +296,19 @@ pub async fn handle(
                             .keep_alive(KeepAlive::default())
                             .into_response();
                     } else {
-                        // Collect stream into a single response.
-                        let mut content = String::new();
-                        let mut reasoning = String::new();
-                        let mut tool_calls_map: std::collections::BTreeMap<u32, (Option<String>, Option<String>, String)> =
+                        // Collect stream into a single response. Keyed by
+                        // choice `index` so an `n > 1` request's other
+                        // choices reach the client instead of being merged
+                        // into one (docs/REMEDIATION_PLAN.md Phase 2.3 /
+                        // Audit A08) — the common `n == 1` case is just a
+                        // one-entry map.
+                        #[derive(Default)]
+                        struct ChoiceAccumulator {
+                            content: String,
+                            reasoning: String,
+                            tool_calls: std::collections::BTreeMap<u32, (Option<String>, Option<String>, String)>,
+                        }
+                        let mut choices: std::collections::BTreeMap<u32, ChoiceAccumulator> =
                             std::collections::BTreeMap::new();
                         let mut usage = None;
                         let mut finish_reason = None;
@@ -206,20 +317,28 @@ pub async fn handle(
 
                         while let Some(event) = pinned.next().await {
                             match event {
-                                ProviderEvent::ContentDelta { delta, .. } => {
-                                    content.push_str(&delta);
+                                ProviderEvent::ContentDelta { index, delta, .. } => {
+                                    choices.entry(index).or_default().content.push_str(&delta);
                                 }
                                 ProviderEvent::ReasoningDelta { delta, .. } => {
-                                    reasoning.push_str(&delta);
+                                    // Reasoning has no per-choice index in
+                                    // the event model — always attributed to
+                                    // choice 0. See the matching note in
+                                    // openai_compatible.rs.
+                                    choices.entry(0).or_default().reasoning.push_str(&delta);
                                 }
                                 ProviderEvent::ToolCallDelta {
+                                    index,
                                     tool_call_index,
                                     id,
                                     name,
                                     arguments,
                                     ..
                                 } => {
-                                    let entry = tool_calls_map
+                                    let entry = choices
+                                        .entry(index)
+                                        .or_default()
+                                        .tool_calls
                                         .entry(tool_call_index)
                                         .or_insert_with(|| (None, None, String::new()));
                                     if let Some(id_str) = id {
@@ -236,12 +355,19 @@ pub async fn handle(
                                     prompt_tokens,
                                     completion_tokens,
                                     total_tokens,
+                                    cached_tokens,
+                                    reasoning_tokens,
                                     ..
                                 } => {
+                                    // Previously dropped cached/reasoning
+                                    // token detail even when the provider
+                                    // reported it (Audit A08).
                                     usage = Some(serde_json::json!({
                                         "prompt_tokens": prompt_tokens.unwrap_or(0),
                                         "completion_tokens": completion_tokens.unwrap_or(0),
                                         "total_tokens": total_tokens.unwrap_or(0),
+                                        "prompt_tokens_details": { "cached_tokens": cached_tokens.unwrap_or(0) },
+                                        "completion_tokens_details": { "reasoning_tokens": reasoning_tokens.unwrap_or(0) },
                                     }));
                                 }
                                 ProviderEvent::Completed { finish_reason: fr, .. } => {
@@ -266,7 +392,7 @@ pub async fn handle(
                                 continue;
                             }
 
-                            if !should_fb && !retryable {
+                            if !should_fb {
                                 return error_response(
                                     StatusCode::from_u16(status_code.unwrap_or(500))
                                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -278,47 +404,74 @@ pub async fn handle(
                         }
 
                         state.provider_registry.record_request_end(&candidate.provider, false);
+                        state.provider_registry.record_latency(
+                            &candidate.provider,
+                            (Utc::now() - received_at).num_milliseconds().max(0) as u64,
+                        );
 
-                        let tool_calls_json: Vec<serde_json::Value> = tool_calls_map
-                            .values()
-                            .map(|(id, name, args)| {
+                        // At least one choice must always be present, even
+                        // if the provider returned genuinely empty content
+                        // (matches the prior single-choice behavior).
+                        if choices.is_empty() {
+                            choices.insert(0, ChoiceAccumulator::default());
+                        }
+
+                        // Every choice shares the attempt's single
+                        // `finish_reason` — the event model only carries one
+                        // per attempt (see the Completed event), so distinct
+                        // per-choice finish reasons for `n > 1` are not
+                        // currently distinguishable. Documented scoping, not
+                        // an oversight.
+                        let shared_finish_reason = finish_reason.unwrap_or_else(|| "stop".to_string());
+
+                        let choices_json: Vec<serde_json::Value> = choices
+                            .into_iter()
+                            .map(|(index, acc)| {
+                                let tool_calls_json: Vec<serde_json::Value> = acc
+                                    .tool_calls
+                                    .values()
+                                    .map(|(id, name, args)| {
+                                        serde_json::json!({
+                                            "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                                            "type": "function",
+                                            "function": {
+                                                "name": name.clone().unwrap_or_default(),
+                                                "arguments": args.clone(),
+                                            }
+                                        })
+                                    })
+                                    .collect();
+
+                                let mut message_obj = serde_json::json!({
+                                    "role": "assistant",
+                                    "content": if acc.content.is_empty() && !tool_calls_json.is_empty() {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::Value::String(acc.content)
+                                    },
+                                });
+
+                                if !acc.reasoning.is_empty() {
+                                    message_obj["reasoning_content"] = serde_json::Value::String(acc.reasoning);
+                                }
+                                if !tool_calls_json.is_empty() {
+                                    message_obj["tool_calls"] = serde_json::Value::Array(tool_calls_json);
+                                }
+
                                 serde_json::json!({
-                                    "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
-                                    "type": "function",
-                                    "function": {
-                                        "name": name.clone().unwrap_or_default(),
-                                        "arguments": args.clone(),
-                                    }
+                                    "index": index,
+                                    "message": message_obj,
+                                    "finish_reason": shared_finish_reason,
                                 })
                             })
                             .collect();
-
-                        let mut message_obj = serde_json::json!({
-                            "role": "assistant",
-                            "content": if content.is_empty() && !tool_calls_json.is_empty() {
-                                serde_json::Value::Null
-                            } else {
-                                serde_json::Value::String(content)
-                            },
-                        });
-
-                        if !reasoning.is_empty() {
-                            message_obj["reasoning_content"] = serde_json::Value::String(reasoning);
-                        }
-                        if !tool_calls_json.is_empty() {
-                            message_obj["tool_calls"] = serde_json::Value::Array(tool_calls_json);
-                        }
 
                         let response = serde_json::json!({
                             "id": format!("chatcmpl-{}", request_id),
                             "object": "chat.completion",
                             "created": Utc::now().timestamp(),
                             "model": candidate.model,
-                            "choices": [{
-                                "index": 0,
-                                "message": message_obj,
-                                "finish_reason": finish_reason.or_else(|| Some("stop".to_string())),
-                            }],
+                            "choices": choices_json,
                             "usage": usage,
                         });
 
@@ -349,6 +502,19 @@ pub async fn handle(
                     state.provider_registry.record_request_end(&candidate.provider, true);
                     last_error = Some(message.clone());
 
+                    state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                        request_id,
+                        attempt_number,
+                        timestamp: Utc::now(),
+                        status: attempt_status_for_code(&code),
+                        finish_reason: None,
+                        provider_response_id: None,
+                        upstream_provider: None,
+                        duration_us: (Utc::now() - attempt_started_at).num_microseconds().unwrap_or(0) as u64,
+                        error_code: Some(code.clone()),
+                        error_message: Some(message.clone()),
+                    });
+
                     let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
 
                     if retryable && attempt + 1 < max_retries {
@@ -356,7 +522,13 @@ pub async fn handle(
                         continue;
                     }
 
-                    if !should_fb && !retryable {
+                    // `should_fb` (derived from `routing.fallback_on`) is the
+                    // sole authority for whether we move to the next
+                    // candidate once retries are exhausted — previously
+                    // `!should_fb && !retryable` meant a retryable error with
+                    // `fallback_on: []` still silently fell back to the next
+                    // provider (Audit A12).
+                    if !should_fb {
                         return error_response(
                             StatusCode::from_u16(status_code.unwrap_or(500))
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -368,17 +540,60 @@ pub async fn handle(
                 }
 
                 Ok(Ok(_)) => {
-                    state.provider_registry.record_request_end(&candidate.provider, false);
-                    last_error = Some("Unexpected provider output".to_string());
-                    continue 'candidate_loop;
+                    // The adapter returned a `ProviderOutput` variant this
+                    // loop doesn't otherwise handle — an adapter bug, not a
+                    // normal fallback-trigger category, so it is never
+                    // silently retried onto another provider (Audit A12).
+                    state.provider_registry.record_request_end(&candidate.provider, true);
+                    state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                        request_id,
+                        attempt_number,
+                        timestamp: Utc::now(),
+                        status: AttemptStatus::Failed,
+                        finish_reason: None,
+                        provider_response_id: None,
+                        upstream_provider: None,
+                        duration_us: (Utc::now() - attempt_started_at).num_microseconds().unwrap_or(0) as u64,
+                        error_code: Some("unexpected_output".to_string()),
+                        error_message: Some("Unexpected provider output".to_string()),
+                    });
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "Unexpected provider output",
+                    );
                 }
 
                 Ok(Err(e)) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
+                    let code = classify_execution_error(&e);
                     last_error = Some(e.to_string());
+
+                    state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                        request_id,
+                        attempt_number,
+                        timestamp: Utc::now(),
+                        status: AttemptStatus::Failed,
+                        finish_reason: None,
+                        provider_response_id: None,
+                        upstream_provider: None,
+                        duration_us: (Utc::now() - attempt_started_at).num_microseconds().unwrap_or(0) as u64,
+                        error_code: Some(code.to_string()),
+                        error_message: last_error.clone(),
+                    });
+
                     if attempt + 1 < max_retries {
                         tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
                         continue;
+                    }
+
+                    let should_fb = fallback::should_fallback(&retry_config, code, None);
+                    if !should_fb {
+                        return error_response(
+                            StatusCode::BAD_GATEWAY,
+                            code,
+                            &last_error.clone().unwrap_or_default(),
+                        );
                     }
                     continue 'candidate_loop;
                 }
@@ -387,6 +602,19 @@ pub async fn handle(
                     state.provider_registry.record_request_end(&candidate.provider, true);
                     let err_msg = format!("Attempt timed out after {}s", state.config.routing.attempt_timeout_secs);
                     last_error = Some(err_msg.clone());
+
+                    state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                        request_id,
+                        attempt_number,
+                        timestamp: Utc::now(),
+                        status: AttemptStatus::Timeout,
+                        finish_reason: None,
+                        provider_response_id: None,
+                        upstream_provider: None,
+                        duration_us: (Utc::now() - attempt_started_at).num_microseconds().unwrap_or(0) as u64,
+                        error_code: Some("timeout".to_string()),
+                        error_message: Some(err_msg.clone()),
+                    });
 
                     let should_fb = fallback::should_fallback(&retry_config, "timeout", Some(504));
                     if attempt + 1 < max_retries {
@@ -504,8 +732,89 @@ pub fn event_to_sse(event: &ProviderEvent, id: &str, created: i64, model: &str) 
             });
             Some(serde_json::to_string(&data).unwrap_or_default())
         }
+        // Previously discarded entirely (Audit A08) — usage is one of the
+        // explicit metrics the gateway exists to capture, and OpenAI's own
+        // `stream_options: {"include_usage": true}` convention delivers it
+        // as a final chunk with empty choices, which we mirror here.
+        ProviderEvent::UsageUpdate {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+            ..
+        } => {
+            let data = serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens.unwrap_or(0),
+                    "completion_tokens": completion_tokens.unwrap_or(0),
+                    "total_tokens": total_tokens.unwrap_or(0),
+                    "prompt_tokens_details": { "cached_tokens": cached_tokens.unwrap_or(0) },
+                    "completion_tokens_details": { "reasoning_tokens": reasoning_tokens.unwrap_or(0) },
+                }
+            });
+            Some(serde_json::to_string(&data).unwrap_or_default())
+        }
+        // A mid-stream provider error was previously dropped entirely here
+        // (the catch-all `_ => None` below), so a client that had already
+        // received a partial response saw it end silently with only
+        // `[DONE]` and no indication anything went wrong (Audit A04).
+        // OpenAI's streaming protocol has no single standardized error
+        // chunk shape, so we emit the same `{"error": {...}}` envelope used
+        // for non-streaming failures, as its own SSE data line before the
+        // stream's trailing `[DONE]`.
+        ProviderEvent::Error { code, message, .. } => {
+            let data = serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "error": {
+                    "message": message,
+                    "type": code,
+                    "code": code,
+                }
+            });
+            Some(serde_json::to_string(&data).unwrap_or_default())
+        }
         _ => None,
     }
+}
+
+/// Map a fallback-trigger-style error code to an `AttemptStatus` for
+/// telemetry, mirroring `InstrumentedStream`'s classification so attempts
+/// recorded via the streaming and non-streaming paths use consistent status
+/// values.
+pub fn attempt_status_for_code(code: &str) -> AttemptStatus {
+    if code == "rate_limit" || code == "429" {
+        AttemptStatus::RateLimited
+    } else if code == "timeout" {
+        AttemptStatus::Timeout
+    } else {
+        AttemptStatus::Failed
+    }
+}
+
+/// Classify a generic provider execution error (connection failures, DNS
+/// errors, etc. surfaced as `anyhow::Error` before any `ProviderEvent` could
+/// be constructed) into a fallback-trigger code, so `fallback_on` config is
+/// authoritative here too rather than these errors always falling back
+/// unconditionally (Audit A12).
+pub fn classify_execution_error(e: &anyhow::Error) -> &'static str {
+    if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+        if reqwest_err.is_timeout() {
+            return "timeout";
+        }
+        if reqwest_err.is_connect() {
+            return "unavailable";
+        }
+    }
+    "unavailable"
 }
 
 /// Build an OpenAI-compatible error response.

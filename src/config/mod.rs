@@ -31,6 +31,22 @@ pub struct GatewayConfig {
     /// Telemetry / database configuration.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Per-deployment pricing, keyed by `"provider/model"` (matching a
+    /// `ModelCandidate`'s `provider`/`model` fields). Optional — deployments
+    /// with no entry here simply produce no `cost_records` row, rather than
+    /// a fabricated zero cost. Previously `cost_records`/`CostRecorded`
+    /// existed with no producer at all (docs/REMEDIATION_PLAN.md Phase 3.5 /
+    /// Audit A15/A17).
+    #[serde(default)]
+    pub pricing: HashMap<String, PricingEntry>,
+}
+
+/// Cost per 1,000 tokens for one provider/model deployment, in USD.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PricingEntry {
+    pub input_cost_per_1k: f64,
+    pub output_cost_per_1k: f64,
 }
 
 /// Server bind / runtime configuration.
@@ -167,6 +183,13 @@ pub struct TelemetryConfig {
     /// Whether to store individual stream chunk events.
     #[serde(default = "default_true")]
     pub store_stream_events: bool,
+
+    /// Path to an append-only JSONL file used as a last-resort durability
+    /// backstop when a batch fails to persist after all retries are
+    /// exhausted. Not a full durable outbox (see docs/REMEDIATION_PLAN.md
+    /// Phase 5.1) — just prevents an outage from silently discarding data.
+    #[serde(default = "default_fallback_log_path")]
+    pub fallback_log_path: String,
 }
 
 impl Default for TelemetryConfig {
@@ -180,6 +203,7 @@ impl Default for TelemetryConfig {
             flush_interval_ms: default_flush_interval(),
             store_raw_bodies: true,
             store_stream_events: true,
+            fallback_log_path: default_fallback_log_path(),
         }
     }
 }
@@ -204,11 +228,30 @@ fn default_flush_interval() -> u64 {
     1000
 }
 
+fn default_fallback_log_path() -> String {
+    "telemetry_fallback.jsonl".to_string()
+}
+
+/// Fallback-trigger names recognized by `routing.fallback_on`.
+const KNOWN_FALLBACK_TRIGGERS: &[&str] =
+    &["timeout", "rate_limit", "unavailable", "server_error", "content_filter"];
+
+/// Routing policy names with real dispatch logic in `Router::route`. A
+/// request-level `routing.policy` override naming a *recognized but
+/// unimplemented* policy (see `RoutingPolicy` in `src/routing/policy.rs`)
+/// fails that one request at routing time with a clear error
+/// (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit CL03) — but `default_policy`
+/// is checked at startup against this narrower, actually-implemented list,
+/// so a config that passes validation can never make *every* request fail.
+const IMPLEMENTED_ROUTING_POLICIES: &[&str] =
+    &["ordered", "priority", "round_robin", "lowest_latency"];
+
 impl GatewayConfig {
     /// Load configuration from a YAML file.
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())?;
         let config: GatewayConfig = serde_yaml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -226,7 +269,67 @@ impl GatewayConfig {
         }
 
         tracing::warn!("No configuration file found, using defaults");
-        Ok(Self::default_config())
+        let config = Self::default_config();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reject configuration values that would otherwise fail silently or
+    /// panic deep inside the telemetry/routing subsystems at runtime.
+    ///
+    /// See docs/REMEDIATION_PLAN.md Phase 0.6 and Phase 1.5.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.telemetry.batch_size == 0 {
+            anyhow::bail!(
+                "telemetry.batch_size must be greater than 0 (tokio::sync::mpsc::channel panics on a zero-capacity buffer)"
+            );
+        }
+        if self.telemetry.flush_interval_ms == 0 {
+            anyhow::bail!(
+                "telemetry.flush_interval_ms must be greater than 0 (tokio::time::interval panics on a zero duration)"
+            );
+        }
+        if self.telemetry.pool_size == 0 {
+            anyhow::bail!("telemetry.pool_size must be greater than 0");
+        }
+
+        if !IMPLEMENTED_ROUTING_POLICIES.contains(&self.routing.default_policy.as_str()) {
+            anyhow::bail!(
+                "routing.default_policy '{}' is not an implemented policy. Implemented policies: {}",
+                self.routing.default_policy,
+                IMPLEMENTED_ROUTING_POLICIES.join(", ")
+            );
+        }
+
+        for trigger in &self.routing.fallback_on {
+            if !KNOWN_FALLBACK_TRIGGERS.contains(&trigger.as_str()) {
+                anyhow::bail!(
+                    "routing.fallback_on entry '{}' is not a recognized trigger. Known triggers: {}",
+                    trigger,
+                    KNOWN_FALLBACK_TRIGGERS.join(", ")
+                );
+            }
+        }
+
+        for (alias, definition) in &self.models {
+            for candidate in &definition.candidates {
+                if !self.providers.contains_key(&candidate.provider) {
+                    anyhow::bail!(
+                        "model '{}' references undefined provider '{}'",
+                        alias,
+                        candidate.provider
+                    );
+                }
+            }
+        }
+
+        for (deployment, price) in &self.pricing {
+            if price.input_cost_per_1k < 0.0 || price.output_cost_per_1k < 0.0 {
+                anyhow::bail!("pricing entry '{}' has a negative cost per 1k tokens", deployment);
+            }
+        }
+
+        Ok(())
     }
 
     fn default_config() -> Self {
@@ -236,6 +339,7 @@ impl GatewayConfig {
             models: HashMap::new(),
             routing: RoutingConfig::default(),
             telemetry: TelemetryConfig::default(),
+            pricing: HashMap::new(),
         }
     }
 

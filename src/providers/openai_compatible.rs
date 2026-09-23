@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream;
 use reqwest::Client;
 use url::Url;
@@ -20,6 +20,16 @@ use crate::types::{GatewayRequest, ModelCapabilities, ModelInfo, ProviderConfig,
 // - Provider-specific request parameters (min_p, top_k, etc.)
 // - Response enrichment (upstream_provider extraction, GPU metrics)
 // - Capability overrides
+
+/// True if a URL path segment looks like an API version marker, e.g.
+/// `v1`, `v1beta`, `v2alpha` — a `v` followed by at least one digit.
+fn is_version_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    if chars.next() != Some('v') {
+        return false;
+    }
+    chars.next().is_some_and(|c| c.is_ascii_digit())
+}
 
 /// Configuration for an OpenAI-compatible provider instance.
 pub struct OpenAICompatibleAdapter {
@@ -70,10 +80,30 @@ impl OpenAICompatibleAdapter {
     }
 
     /// Build the full URL for a given path (e.g. "/v1/chat/completions").
+    ///
+    /// Providers configure their `base_url` inconsistently with respect to
+    /// API versioning: some are unversioned roots that need the canonical
+    /// `/v1/...` path appended in full (llama.cpp, OpenRouter), while others
+    /// already embed a version segment somewhere in their path that is not
+    /// literally `v1` (e.g. Gemini's OpenAI-compat root is
+    /// `.../v1beta/openai`). Appending our own `v1/` on top of an
+    /// already-versioned base produces a broken URL (previously this only
+    /// checked for a literal `/v1` suffix, which missed `v1beta` and any
+    /// non-trailing version segment). We instead check whether *any* path
+    /// segment of the base URL looks like an API version marker
+    /// (`v` followed by a digit, e.g. `v1`, `v1beta`, `v2alpha`) and skip
+    /// re-adding `v1/` if so.
     pub fn endpoint(&self, path: &str) -> String {
         let base = self.base_url.as_str().trim_end_matches('/');
         let path_clean = path.strip_prefix('/').unwrap_or(path);
-        if base.ends_with("/v1") && path_clean.starts_with("v1/") {
+
+        let base_already_versioned = self
+            .base_url
+            .path_segments()
+            .map(|mut segments| segments.any(is_version_segment))
+            .unwrap_or(false);
+
+        if base_already_versioned && path_clean.starts_with("v1/") {
             format!("{}/{}", base, &path_clean[3..])
         } else {
             format!("{}/{}", base, path_clean)
@@ -131,6 +161,11 @@ impl OpenAICompatibleAdapter {
         if let Some(max) = request.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
         }
+        if let Some(max_completion) = request.max_completion_tokens {
+            // OpenAI's o-series models reject `max_tokens` and require this
+            // instead; previously silently dropped (Audit A08).
+            body["max_completion_tokens"] = serde_json::json!(max_completion);
+        }
         if let Some(ref stop) = request.stop {
             body["stop"] = serde_json::to_value(stop).unwrap_or_default();
         }
@@ -139,6 +174,47 @@ impl OpenAICompatibleAdapter {
         }
         if let Some(ref tool_choice) = request.tool_choice {
             body["tool_choice"] = tool_choice.clone();
+        }
+        if let Some(parallel) = request.parallel_tool_calls {
+            body["parallel_tool_calls"] = serde_json::json!(parallel);
+        }
+        if let Some(ref modalities) = request.modalities {
+            // Previously accepted by the request schema but never
+            // forwarded to any provider (Audit A08) — accept-and-ignore is
+            // worse than either forwarding or rejecting, so it's forwarded
+            // as-is; providers that don't support a requested modality will
+            // reject it themselves rather than the gateway silently
+            // pretending it was honored.
+            body["modalities"] = serde_json::to_value(modalities).unwrap_or_default();
+        }
+        // Top-level `reasoning_effort` (OpenAI o-series) is independent of
+        // the nested `reasoning` object below (OpenRouter/Anthropic-style);
+        // a caller may set either or both. Previously silently dropped
+        // (Audit A08).
+        if let Some(ref effort) = request.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        if let Some(ref reasoning) = request.reasoning
+            && reasoning.enabled
+        {
+            // The canonical `reasoning` control participated in capability
+            // filtering but was never actually forwarded to any provider
+            // (Audit A07). There is no single universal wire format for
+            // this across OpenAI-compatible providers, so we emit both of
+            // the two shapes in common use and let providers ignore the one
+            // they don't recognize: OpenRouter/Anthropic-style providers
+            // read a nested `reasoning` object, while OpenAI's o-series
+            // models read a top-level `reasoning_effort` string.
+            let mut reasoning_obj = serde_json::Map::new();
+            reasoning_obj.insert("enabled".to_string(), serde_json::json!(true));
+            if let Some(effort) = &reasoning.effort {
+                reasoning_obj.insert("effort".to_string(), serde_json::json!(effort));
+                body["reasoning_effort"] = serde_json::json!(effort);
+            }
+            if let Some(max_tokens) = reasoning.max_tokens {
+                reasoning_obj.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+            }
+            body["reasoning"] = serde_json::Value::Object(reasoning_obj);
         }
         if let Some(ref format) = request.response_format {
             body["response_format"] = serde_json::to_value(format).unwrap_or_default();
@@ -173,6 +249,101 @@ impl OpenAICompatibleAdapter {
         }
 
         body
+    }
+
+    /// Convert a complete non-streaming chat-completions response body into
+    /// the internal `ProviderEvent` sequence, one content/tool-call set per
+    /// choice — not just `choices[0]` — so an `n > 1` request's other
+    /// choices actually reach the client and telemetry instead of being
+    /// silently dropped (docs/REMEDIATION_PLAN.md Phase 2.3 / Audit A08).
+    /// Reasoning is only captured for choice 0: `ReasoningDelta` has no
+    /// per-choice index in the event model, and reasoning-capable models
+    /// are not commonly combined with `n > 1` — documented scoping, not an
+    /// oversight. Factored out from `execute()` so it can be unit tested
+    /// without a network round-trip.
+    pub fn events_from_non_streaming_response(
+        response_body: &serde_json::Value,
+        started: DateTime<Utc>,
+        provider_name: String,
+        model_name: String,
+    ) -> Vec<ProviderEvent> {
+        let choices = response_body["choices"].as_array().cloned().unwrap_or_default();
+        let primary_choice = choices.first().cloned().unwrap_or(serde_json::json!({}));
+
+        let usage_event = ProviderEvent::UsageUpdate {
+            timestamp: Utc::now(),
+            prompt_tokens: response_body["usage"]["prompt_tokens"].as_u64(),
+            completion_tokens: response_body["usage"]["completion_tokens"].as_u64(),
+            total_tokens: response_body["usage"]["total_tokens"].as_u64(),
+            cached_tokens: response_body["usage"]
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|t| t.as_u64()),
+            reasoning_tokens: response_body["usage"]
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|t| t.as_u64()),
+            raw_usage: response_body.get("usage").cloned(),
+        };
+
+        let mut events = vec![ProviderEvent::Started {
+            timestamp: started,
+            provider: provider_name,
+            model: model_name,
+        }];
+
+        for (choice_idx, choice) in choices.iter().enumerate() {
+            let choice_index = choice["index"].as_u64().unwrap_or(choice_idx as u64) as u32;
+            let message = &choice["message"];
+
+            let content = message["content"].as_str().unwrap_or_default().to_string();
+            if !content.is_empty() {
+                events.push(ProviderEvent::ContentDelta {
+                    timestamp: Utc::now(),
+                    index: choice_index,
+                    delta: content,
+                });
+            }
+
+            if choice_index == 0 {
+                let reasoning = message
+                    .get("reasoning_content")
+                    .or_else(|| message.get("reasoning"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !reasoning.is_empty() {
+                    events.push(ProviderEvent::ReasoningDelta {
+                        timestamp: Utc::now(),
+                        delta: reasoning,
+                    });
+                }
+            }
+
+            if let Some(tool_calls) = message["tool_calls"].as_array() {
+                for (tc_idx, tc) in tool_calls.iter().enumerate() {
+                    events.push(ProviderEvent::ToolCallDelta {
+                        timestamp: Utc::now(),
+                        index: choice_index,
+                        tool_call_index: tc["index"].as_u64().unwrap_or(tc_idx as u64) as u32,
+                        id: tc["id"].as_str().map(|s| s.to_string()),
+                        name: tc["function"]["name"].as_str().map(|s| s.to_string()),
+                        arguments: tc["function"]["arguments"].as_str().map(|s| s.to_string()),
+                    });
+                }
+            }
+        }
+
+        events.push(usage_event);
+        events.push(ProviderEvent::Completed {
+            timestamp: Utc::now(),
+            finish_reason: primary_choice["finish_reason"].as_str().map(|s| s.to_string()),
+            provider_response_id: response_body["id"].as_str().map(|s| s.to_string()),
+            upstream_provider: None,
+            raw_response: Some(response_body.clone()),
+        });
+
+        events
     }
 }
 
@@ -275,77 +446,12 @@ impl Provider for OpenAICompatibleAdapter {
                 }));
             }
 
-            // Build content, reasoning, tool_calls and usage events from the response.
-            let choice = &response_body["choices"][0];
-            let message = &choice["message"];
-            let content = message["content"].as_str().unwrap_or_default().to_string();
-
-            let reasoning = message
-                .get("reasoning_content")
-                .or_else(|| message.get("reasoning"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-
-            let usage_event = ProviderEvent::UsageUpdate {
-                timestamp: Utc::now(),
-                prompt_tokens: response_body["usage"]["prompt_tokens"].as_u64(),
-                completion_tokens: response_body["usage"]["completion_tokens"].as_u64(),
-                total_tokens: response_body["usage"]["total_tokens"].as_u64(),
-                cached_tokens: response_body["usage"]
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(|t| t.as_u64()),
-                reasoning_tokens: response_body["usage"]
-                    .get("completion_tokens_details")
-                    .and_then(|d| d.get("reasoning_tokens"))
-                    .and_then(|t| t.as_u64()),
-                raw_usage: response_body.get("usage").cloned(),
-            };
-
-            let mut events = vec![
-                ProviderEvent::Started {
-                    timestamp: started,
-                    provider: provider_name,
-                    model: model_name,
-                },
-            ];
-
-            if !content.is_empty() {
-                events.push(ProviderEvent::ContentDelta {
-                    timestamp: Utc::now(),
-                    index: 0,
-                    delta: content,
-                });
-            }
-
-            if !reasoning.is_empty() {
-                events.push(ProviderEvent::ReasoningDelta {
-                    timestamp: Utc::now(),
-                    delta: reasoning,
-                });
-            }
-
-            if let Some(tool_calls) = message["tool_calls"].as_array() {
-                for (tc_idx, tc) in tool_calls.iter().enumerate() {
-                    events.push(ProviderEvent::ToolCallDelta {
-                        timestamp: Utc::now(),
-                        index: 0,
-                        tool_call_index: tc["index"].as_u64().unwrap_or(tc_idx as u64) as u32,
-                        id: tc["id"].as_str().map(|s| s.to_string()),
-                        name: tc["function"]["name"].as_str().map(|s| s.to_string()),
-                        arguments: tc["function"]["arguments"].as_str().map(|s| s.to_string()),
-                    });
-                }
-            }
-
-            events.push(usage_event);
-            events.push(ProviderEvent::Completed {
-                timestamp: Utc::now(),
-                finish_reason: choice["finish_reason"].as_str().map(|s| s.to_string()),
-                provider_response_id: response_body["id"].as_str().map(|s| s.to_string()),
-                upstream_provider: None,
-            });
+            let events = Self::events_from_non_streaming_response(
+                &response_body,
+                started,
+                provider_name,
+                model_name,
+            );
 
             return Ok(ProviderOutput::Stream(Box::pin(stream::iter(events))));
         }
@@ -407,6 +513,7 @@ impl Provider for OpenAICompatibleAdapter {
             use futures::StreamExt;
             let mut byte_stream = std::pin::pin!(byte_stream);
             let mut byte_buffer = Vec::new();
+            let mut first_byte_seen = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -422,6 +529,11 @@ impl Provider for OpenAICompatibleAdapter {
                         return;
                     }
                 };
+
+                if !first_byte_seen {
+                    first_byte_seen = true;
+                    yield ProviderEvent::FirstByte { timestamp: Utc::now() };
+                }
 
                 byte_buffer.extend_from_slice(&chunk);
 
@@ -450,41 +562,71 @@ impl Provider for OpenAICompatibleAdapter {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                             let now = Utc::now();
 
-                            // Extract content delta.
-                            if let Some(delta_content) = parsed["choices"][0]["delta"]["content"].as_str()
-                                && !delta_content.is_empty()
-                            {
-                                yield ProviderEvent::ContentDelta {
-                                    timestamp: now,
-                                    index: parsed["choices"][0]["index"].as_u64().unwrap_or(0) as u32,
-                                    delta: delta_content.to_string(),
-                                };
-                            }
+                            // Iterate every entry in `choices`, not just
+                            // index 0 — with `n > 1`, a chunk can carry
+                            // deltas for more than one choice, each tagged
+                            // with its own `index` (docs/REMEDIATION_PLAN.md
+                            // Phase 2.3 / Audit A08). Reasoning is only
+                            // captured for choice 0: `ReasoningDelta` has no
+                            // per-choice index in the event model, and
+                            // reasoning-capable models are not commonly
+                            // combined with `n > 1` — documented scoping,
+                            // not an oversight.
+                            if let Some(choices) = parsed["choices"].as_array() {
+                                for choice in choices {
+                                    let choice_index = choice["index"].as_u64().unwrap_or(0) as u32;
+                                    let delta = &choice["delta"];
 
-                            // Extract reasoning delta (if present).
-                            if let Some(reasoning) = parsed["choices"][0]["delta"]
-                                .get("reasoning_content")
-                                .or_else(|| parsed["choices"][0]["delta"].get("reasoning"))
-                                .and_then(|v| v.as_str())
-                                && !reasoning.is_empty()
-                            {
-                                yield ProviderEvent::ReasoningDelta {
-                                    timestamp: now,
-                                    delta: reasoning.to_string(),
-                                };
-                            }
+                                    if let Some(delta_content) = delta["content"].as_str()
+                                        && !delta_content.is_empty()
+                                    {
+                                        yield ProviderEvent::ContentDelta {
+                                            timestamp: now,
+                                            index: choice_index,
+                                            delta: delta_content.to_string(),
+                                        };
+                                    }
 
-                            // Extract tool call deltas.
-                            if let Some(tool_calls) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
-                                for tc in tool_calls {
-                                    yield ProviderEvent::ToolCallDelta {
-                                        timestamp: now,
-                                        index: parsed["choices"][0]["index"].as_u64().unwrap_or(0) as u32,
-                                        tool_call_index: tc["index"].as_u64().unwrap_or(0) as u32,
-                                        id: tc["id"].as_str().map(|s| s.to_string()),
-                                        name: tc["function"]["name"].as_str().map(|s| s.to_string()),
-                                        arguments: tc["function"]["arguments"].as_str().map(|s| s.to_string()),
-                                    };
+                                    if choice_index == 0
+                                        && let Some(reasoning) = delta
+                                            .get("reasoning_content")
+                                            .or_else(|| delta.get("reasoning"))
+                                            .and_then(|v| v.as_str())
+                                        && !reasoning.is_empty()
+                                    {
+                                        yield ProviderEvent::ReasoningDelta {
+                                            timestamp: now,
+                                            delta: reasoning.to_string(),
+                                        };
+                                    }
+
+                                    if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                                        for tc in tool_calls {
+                                            yield ProviderEvent::ToolCallDelta {
+                                                timestamp: now,
+                                                index: choice_index,
+                                                tool_call_index: tc["index"].as_u64().unwrap_or(0) as u32,
+                                                id: tc["id"].as_str().map(|s| s.to_string()),
+                                                name: tc["function"]["name"].as_str().map(|s| s.to_string()),
+                                                arguments: tc["function"]["arguments"].as_str().map(|s| s.to_string()),
+                                            };
+                                        }
+                                    }
+
+                                    if let Some(reason) = choice["finish_reason"].as_str() {
+                                        yield ProviderEvent::Completed {
+                                            timestamp: now,
+                                            finish_reason: Some(reason.to_string()),
+                                            provider_response_id: parsed["id"].as_str().map(|s| s.to_string()),
+                                            upstream_provider: None,
+                                            // A real SSE stream has no single
+                                            // response body to preserve here —
+                                            // each chunk was already forwarded
+                                            // as its own StreamChunk telemetry
+                                            // event.
+                                            raw_response: None,
+                                        };
+                                    }
                                 }
                             }
 
@@ -504,16 +646,6 @@ impl Provider for OpenAICompatibleAdapter {
                                         .and_then(|d| d.get("reasoning_tokens"))
                                         .and_then(|t| t.as_u64()),
                                     raw_usage: Some(usage.clone()),
-                                };
-                            }
-
-                            // Extract finish reason.
-                            if let Some(reason) = parsed["choices"][0]["finish_reason"].as_str() {
-                                yield ProviderEvent::Completed {
-                                    timestamp: now,
-                                    finish_reason: Some(reason.to_string()),
-                                    provider_response_id: parsed["id"].as_str().map(|s| s.to_string()),
-                                    upstream_provider: None,
                                 };
                             }
                         }

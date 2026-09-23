@@ -76,27 +76,24 @@ erDiagram
     inference_requests ||--o{ tool_calls : executes
     inference_requests ||--o{ cost_records : calculates
     inference_requests ||--o{ errors : logs
-    inference_requests ||--o{ client_disconnects : monitors
-    inference_requests ||--o{ evaluations : rates
-    inference_requests ||--o{ dataset_entries : exports
 ```
 
 ### Table Breakdown
 
 | Table | Primary Purpose | Key Fields |
 |:---|:---|:---|
-| [`inference_requests`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L19) | Top-level request entity | `request_id` (UUIDv7), `received_at`, `requested_model`, `resolved_model`, `serving_provider`, `success`, `total_latency_us`, `canonical_messages` (JSONB) |
+| [`inference_requests`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L19) | Top-level request entity | `request_id` (UUIDv7, gateway-generated primary key), `client_correlation_id` (opaque client-supplied ID, e.g. `x-request-id` — never used as a join key), `received_at`, `requested_model`, `resolved_model`, `serving_provider`, `success`, `total_latency_us`, `canonical_messages` (JSONB) |
 | [`request_tags`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L63) | User-defined classification | `request_id`, `tag` (e.g. `eval`, `benchmark`, `test`, `prod`) |
 | [`routing_decisions`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L77) | Full routing audit trail | `request_id`, `requested_model`, `candidates_considered`, `candidates_rejected`, `rejection_reasons` (JSONB), `policy_applied` |
-| [`provider_attempts`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L106) | Fallback chain attempts | `request_id`, `attempt_number`, `provider`, `model`, `status`, `duration_us`, `error_code`, `error_message` |
+| [`provider_attempts`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L106) | Fallback chain attempts | `request_id`, `attempt_number`, `provider`, `model`, `status`, `duration_us`, `error_code`, `error_message`, `first_byte_at`, `first_token_at`, `synthetic_timing` (migration `004`) |
 | [`generations`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L142) | Output text & reasoning | `request_id`, `content`, `reasoning_content`, `reasoning_visibility`, `tool_calls` (JSONB), `raw_response` (JSONB) |
 | [`generation_usage`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L173) | Token usage breakdown | `request_id`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` |
-| [`stream_events`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L204) | Chunk-level timeline | `request_id`, `sequence`, `chunk_type`, `byte_count`, `timestamp` |
-| [`tool_calls`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L222) | Function calling audit | `request_id`, `tool_name`, `tool_call_id`, `arguments` (JSONB) |
-| [`cost_records`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L236) | Precise cost accounting | `request_id`, `prompt_cost_usd`, `completion_cost_usd`, `total_cost_usd` |
-| [`errors`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L254) | Structured failure logs | `request_id`, `error_type`, `error_code`, `message`, `http_status` |
-| [`client_disconnects`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L273) | Client abort tracking | `request_id`, `interrupted_at`, `bytes_delivered` |
-| [`evaluations`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L288) | Quality scoring / human feedback | `request_id`, `metric`, `score`, `feedback` |
+| [`stream_events`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L204) | Chunk-level timeline | `request_id`, `sequence`, `chunk_type`, `byte_count`, `timestamp`, `synthetic` (migration `004`) |
+| [`tool_calls`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L222) | Function calling audit | `request_id`, `function_name`, `tool_call_id`, `arguments` (JSON string) |
+| [`errors`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L242) | Structured failure logs | `request_id`, `error_code`, `error_message`, `status_code`, `provider`, `retryable` |
+| [`cost_records`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L263) | Estimated cost, computed from `config.pricing` (keyed by `"provider/model"`) against `generation_usage` when a price is configured for that deployment — no entry means no price was configured, not a zero cost | `request_id`, `estimated_cost`, `currency`, `provider`, `model`, `input_cost`, `output_cost` |
+| [`model_snapshots`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L287) | Point-in-time model metadata, written once per model alias at gateway startup | `model_name`, `providers` (JSONB), `capabilities` (JSONB), `snapshot_at` |
+| [`provider_snapshots`](file:///s:/Code/RustProjects/AI-Gateway/migrations/001_initial_schema.sql#L302) | Point-in-time provider health/counters, written on every background health-check tick (every 30s) | `provider_name`, `provider_type`, `health`, `total_requests`, `total_errors`, `avg_latency_ms`, `snapshot_at` |
 
 ---
 
@@ -104,8 +101,11 @@ erDiagram
 
 The gateway derives granular metrics from the `stream_events` and `provider_attempts` records:
 
+**Always filter out fabricated timing first**: every query in this section should add `WHERE p.synthetic_timing = false` (for `provider_attempts`-only queries) or `WHERE s.synthetic = false` (for `stream_events`-level queries). A non-streaming request (`stream: false`, or a provider that only supports non-streaming) still produces `ContentDelta`/`FirstByte`/`FirstGenerationChunk` events internally — the full response arrives in one HTTP round-trip and gets replayed as a one-shot event sequence for a uniform code path — but every one of those events lands within microseconds of each other. Averaging that in with genuine per-chunk streaming timing would silently understate real TTFT/TPS/inter-chunk latency. See docs/REMEDIATION_PLAN.md Phase 3.1 / Audit A06 and migration `004_synthetic_timing_flag.sql`.
+
 1. **Time to First Token (TTFT)**:
    $$\text{TTFT} = \text{timestamp}(\text{chunk}_0) - \text{received\_at}$$
+   `provider_attempts.first_token_at` (and `.first_byte_at` for time-to-first-byte, before any token is necessarily parseable) now populate directly during streaming, so this no longer requires deriving from the first `stream_events` row. Only meaningful when `synthetic_timing = false`.
 2. **Inter-Chunk Latency**:
    $$\Delta t_i = \text{timestamp}(\text{chunk}_i) - \text{timestamp}(\text{chunk}_{i-1})$$
    Enables detecting prompt evaluation vs token generation pauses.
@@ -128,7 +128,7 @@ SELECT
     ROUND(AVG(u.completion_tokens * 1000000.0 / NULLIF(p.duration_us, 0)), 2) AS avg_tokens_per_sec
 FROM provider_attempts p
 JOIN generation_usage u ON p.request_id = u.request_id AND p.attempt_number = u.attempt_number
-WHERE p.status = 'success'
+WHERE p.status = 'success' AND p.synthetic_timing = false
 GROUP BY p.provider, p.model
 ORDER BY avg_tokens_per_sec DESC;
 ```

@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use chrono::{DateTime, Utc};
 use futures::Stream;
 use pin_project_lite::pin_project;
 use tokio::sync::mpsc;
@@ -35,11 +34,25 @@ pin_project! {
         telemetry_tx: mpsc::Sender<TelemetryEvent>,
         sequence: u64,
         first_content_seen: bool,
-        started_at: Option<DateTime<Utc>>,
+        // A monotonic clock, not `DateTime<Utc>` subtraction, for the
+        // attempt-duration metric: wall-clock timestamps are not safe to
+        // subtract across an NTP adjustment mid-request
+        // (docs/REMEDIATION_PLAN.md Phase 3.1 / Audit A06). Captured at
+        // construction time (immediately after `provider.execute()`
+        // returns the stream), which is close enough to the adapter's own
+        // `Started` event for this purpose.
+        started_instant: std::time::Instant,
         accumulated_content: String,
         accumulated_reasoning: String,
         tool_calls_map: BTreeMap<u32, (Option<String>, Option<String>, String)>,
         store_stream_events: bool,
+        // True when `inner` is not a genuine live provider stream but a
+        // one-shot sequence of events reconstructed from a single
+        // non-streaming HTTP response (all landing within microseconds of
+        // each other). Propagated into every timing-sensitive telemetry
+        // event this wrapper emits so analytical queries can exclude
+        // fabricated timing (docs/REMEDIATION_PLAN.md Phase 3.1 / Audit A06).
+        synthetic: bool,
     }
 }
 
@@ -50,6 +63,7 @@ impl InstrumentedStream {
         attempt_number: u32,
         telemetry_tx: mpsc::Sender<TelemetryEvent>,
         store_stream_events: bool,
+        synthetic: bool,
     ) -> Self {
         Self {
             inner,
@@ -58,11 +72,12 @@ impl InstrumentedStream {
             telemetry_tx,
             sequence: 0,
             first_content_seen: false,
-            started_at: None,
+            started_instant: std::time::Instant::now(),
             accumulated_content: String::new(),
             accumulated_reasoning: String::new(),
             tool_calls_map: BTreeMap::new(),
             store_stream_events,
+            synthetic,
         }
     }
 }
@@ -86,15 +101,17 @@ impl Stream for InstrumentedStream {
                 let seq = *this.sequence;
 
                 match &event {
-                    ProviderEvent::Started { timestamp, provider, model } => {
-                        *this.started_at = Some(*timestamp);
-                        emit(this.telemetry_tx, TelemetryEvent::ProviderAttemptStarted {
-                            request_id: *this.request_id,
-                            attempt_number: *this.attempt_number,
-                            timestamp: *timestamp,
-                            provider: provider.clone(),
-                            model: model.clone(),
-                        });
+                    ProviderEvent::Started { .. } => {
+                        // ProviderAttemptStarted is emitted by the route
+                        // handler *before* calling `provider.execute()`
+                        // (docs/REMEDIATION_PLAN.md Phase 1.1 / Audit A03),
+                        // so that connection failures and HTTP errors that
+                        // never reach a stream are still recorded. Emitting
+                        // it again here on the adapter's own `Started` event
+                        // would double-record every attempt that does reach
+                        // a stream. The attempt-duration clock
+                        // (`started_instant`) was already captured at
+                        // `InstrumentedStream::new` — nothing to do here.
                     }
 
                     ProviderEvent::Connected { timestamp, connection_latency_us } => {
@@ -106,6 +123,19 @@ impl Stream for InstrumentedStream {
                         });
                     }
 
+                    // Previously had no producer at all — the writer
+                    // received `FirstProviderByte` events only from tests,
+                    // never from real execution (docs/REMEDIATION_PLAN.md
+                    // Phase 3.1 / Audit A06).
+                    ProviderEvent::FirstByte { timestamp } => {
+                        emit(this.telemetry_tx, TelemetryEvent::FirstProviderByte {
+                            request_id: *this.request_id,
+                            attempt_number: *this.attempt_number,
+                            timestamp: *timestamp,
+                            synthetic: *this.synthetic,
+                        });
+                    }
+
                     ProviderEvent::ContentDelta { timestamp, delta, .. } => {
                         if !*this.first_content_seen {
                             *this.first_content_seen = true;
@@ -114,6 +144,7 @@ impl Stream for InstrumentedStream {
                                 attempt_number: *this.attempt_number,
                                 timestamp: *timestamp,
                                 content_preview: Some(delta.chars().take(100).collect()),
+                                synthetic: *this.synthetic,
                             });
                         }
 
@@ -127,6 +158,7 @@ impl Stream for InstrumentedStream {
                                 sequence: seq,
                                 chunk_type: "content".to_string(),
                                 byte_count: delta.len() as u32,
+                                synthetic: *this.synthetic,
                             });
                         }
                     }
@@ -142,6 +174,7 @@ impl Stream for InstrumentedStream {
                                 sequence: seq,
                                 chunk_type: "reasoning".to_string(),
                                 byte_count: delta.len() as u32,
+                                synthetic: *this.synthetic,
                             });
                         }
                     }
@@ -176,6 +209,7 @@ impl Stream for InstrumentedStream {
                                 sequence: seq,
                                 chunk_type: "tool_call".to_string(),
                                 byte_count: arguments.as_ref().map(|a| a.len() as u32).unwrap_or(0),
+                                synthetic: *this.synthetic,
                             });
                         }
                     }
@@ -209,11 +243,9 @@ impl Stream for InstrumentedStream {
                         finish_reason,
                         provider_response_id,
                         upstream_provider,
+                        raw_response,
                     } => {
-                        let duration_us = this
-                            .started_at
-                            .map(|s| (*timestamp - s).num_microseconds().unwrap_or(0) as u64)
-                            .unwrap_or(0);
+                        let duration_us = this.started_instant.elapsed().as_micros() as u64;
 
                         let tool_calls_json: Vec<serde_json::Value> = this
                             .tool_calls_map
@@ -246,7 +278,13 @@ impl Stream for InstrumentedStream {
                             } else {
                                 Some(serde_json::to_value(&tool_calls_json).unwrap_or_default())
                             },
-                            raw_response: None,
+                            // Previously always None regardless of the
+                            // `store_raw_bodies` config flag — now forwards
+                            // whatever the adapter captured (the full body
+                            // for non-streaming requests, None for a real
+                            // SSE stream). The writer still gates storage on
+                            // `store_raw_bodies` itself.
+                            raw_response: raw_response.clone(),
                         });
 
                         emit(this.telemetry_tx, TelemetryEvent::ProviderAttemptCompleted {
@@ -269,10 +307,47 @@ impl Stream for InstrumentedStream {
                         message,
                         ..
                     } => {
-                        let duration_us = this
-                            .started_at
-                            .map(|s| (*timestamp - s).num_microseconds().unwrap_or(0) as u64)
-                            .unwrap_or(0);
+                        let duration_us = this.started_instant.elapsed().as_micros() as u64;
+
+                        // A stream that produced partial content before
+                        // failing must not lose that content — previously
+                        // GenerationContent was only emitted on a clean
+                        // Completed event, so an error mid-stream discarded
+                        // everything generated so far (Audit A04).
+                        if !this.accumulated_content.is_empty() || !this.accumulated_reasoning.is_empty() {
+                            let tool_calls_json: Vec<serde_json::Value> = this
+                                .tool_calls_map
+                                .values()
+                                .map(|(id, name, args)| {
+                                    serde_json::json!({
+                                        "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                                        "type": "function",
+                                        "function": {
+                                            "name": name.clone().unwrap_or_default(),
+                                            "arguments": args.clone(),
+                                        }
+                                    })
+                                })
+                                .collect();
+
+                            emit(this.telemetry_tx, TelemetryEvent::GenerationContent {
+                                request_id: *this.request_id,
+                                attempt_number: *this.attempt_number,
+                                timestamp: *timestamp,
+                                content: this.accumulated_content.clone(),
+                                reasoning_content: if this.accumulated_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(this.accumulated_reasoning.clone())
+                                },
+                                tool_calls: if tool_calls_json.is_empty() {
+                                    None
+                                } else {
+                                    Some(serde_json::to_value(&tool_calls_json).unwrap_or_default())
+                                },
+                                raw_response: None,
+                            });
+                        }
 
                         emit(this.telemetry_tx, TelemetryEvent::ProviderAttemptCompleted {
                             request_id: *this.request_id,

@@ -115,8 +115,10 @@ The request's requirements are dynamically checked against candidate capabilitie
    - If image parts are present, candidates with `vision: false` are excluded.
 2. **Tool Support**:
    - If the request supplies `tools: [...]`, candidates lacking tool support are rejected.
-3. **Context Window Limits**:
-   - If the candidate defines `max_context_length` and estimated token count exceeds the limit, the candidate is disqualified.
+3. **Structured Output & Reasoning**:
+   - If the request supplies `response_format` or `reasoning.enabled: true`, candidates lacking the corresponding capability flag are rejected.
+4. **Context Window**:
+   - If `ModelCandidate.max_context_length` is configured for a candidate, the router estimates the request's token usage (prompt content length / 4, plus `max_completion_tokens`/`max_tokens` if set — a rough heuristic, not a real tokenizer, since no tokenizer dependency exists in this project) and rejects the candidate with reason `"context_length_exceeded"` if the estimate exceeds the limit. A candidate with no configured `max_context_length` is never rejected on this basis. Because the estimate is a heuristic, it should be read as "obviously oversized requests are filtered before a wasted round-trip," not as an exact admission-control guarantee — a request close to the real limit can still surface as a provider-side error instead of being filtered here.
 
 ### Stage 5: Policy Application
 The surviving candidates are ordered according to the configured routing policy:
@@ -125,7 +127,9 @@ The surviving candidates are ordered according to the configured routing policy:
 |:---|:---|
 | **`priority` / `ordered`** (Default) | Sorts candidates strictly by `priority` integer (ascending: 1 is higher priority than 2). |
 | **`round_robin`** | Distributes requests evenly across equal-priority candidates using a rolling atomic counter. |
-| **`lowest_latency`** | Selects the candidate whose provider has the lowest exponential moving average latency. |
+| **`lowest_latency`** | Selects the candidate whose provider has the lowest average *inference* latency (a simple cumulative mean of completed attempt durations, reset only on restart — not an exponential moving average, and tracked separately from background health-check latency; see [`ProviderRegistry::record_latency`](file:///s:/Code/RustProjects/AI-Gateway/src/registry/provider_registry.rs)). |
+
+Six other `RoutingPolicy` names exist as recognized-but-unimplemented enum variants for future work (`local_first`, `cheapest`, `fastest`, `highest_quality`, `balanced`) — `routing.default_policy` is validated at startup and rejects any of them, and a per-request `routing.policy` override naming one fails that request with a clear error rather than silently running ordered routing instead.
 
 ### Stage 6: Decision Telemetry
 The router constructs a [`RoutingDecision`](file:///s:/Code/RustProjects/AI-Gateway/src/routing/mod.rs#L40-L69) object:

@@ -121,3 +121,42 @@ fn test_standard_parameters_preserved_with_options() {
     assert_eq!(body["max_tokens"], 1024);
     assert_eq!(body["guided_json"]["type"], "object");
 }
+
+#[test]
+fn test_previously_dropped_fields_are_forwarded() {
+    // developer role, max_completion_tokens, parallel_tool_calls,
+    // modalities, and top-level reasoning_effort were all previously
+    // accepted by the request schema (or, for developer, rejected outright)
+    // and then silently discarded before reaching any provider (Audit A08).
+    let config = ProviderConfig {
+        name: "test-provider".to_string(),
+        r#type: ProviderType::OpenAiCompatible,
+        base_url: Url::parse("http://localhost:8080/v1").unwrap(),
+        api_key: None,
+        api_key_env: None,
+        default_headers: None,
+        timeout_secs: 30,
+        max_concurrent: None,
+        enabled: true,
+    };
+    let adapter = OpenAICompatibleAdapter::new(&config, ModelCapabilities::default()).unwrap();
+
+    let req: GatewayRequest = serde_json::from_value(serde_json::json!({
+        "model": "o-series-model",
+        "messages": [{"role": "developer", "content": "Be concise."}],
+        "max_completion_tokens": 512,
+        "parallel_tool_calls": false,
+        "modalities": ["text", "audio"],
+        "reasoning_effort": "high"
+    }))
+    .unwrap();
+
+    assert_eq!(req.messages.as_ref().unwrap()[0].role, ai_gateway::types::Role::Developer);
+
+    let body = adapter.build_chat_body(&req, "o-series-model");
+    assert_eq!(body["max_completion_tokens"], 512);
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["modalities"], serde_json::json!(["text", "audio"]));
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["messages"][0]["role"], "developer");
+}

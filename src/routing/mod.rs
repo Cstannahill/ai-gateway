@@ -77,11 +77,15 @@ pub struct RejectionRecord {
 /// The routing engine.
 pub struct Router {
     default_policy: String,
+    round_robin_counters: dashmap::DashMap<String, std::sync::atomic::AtomicUsize>,
 }
 
 impl Router {
     pub fn new(default_policy: String) -> Self {
-        Self { default_policy }
+        Self { 
+            default_policy,
+            round_robin_counters: dashmap::DashMap::new(),
+        }
     }
 
     /// Route a request to an ordered list of provider/model candidates.
@@ -105,8 +109,36 @@ impl Router {
         if let Some(ref routing) = request.routing
             && let Some(ref explicit_provider) = routing.provider
         {
-            // User explicitly specified a provider — bypass all routing.
+            // User explicitly specified a provider — bypass capability and
+            // priority filtering (that's the point of explicit addressing),
+            // but NOT the administrative `enabled` kill switch — an operator
+            // disabling a provider must not be overridable by request-level
+            // routing hints. See ProviderRegistry::is_enabled's doc comment
+            // and docs/REMEDIATION_PLAN.md Phase 1.4 / Audit A11.
             let model_id = &request.model;
+
+            if !provider_registry.is_enabled(explicit_provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: model_id.clone(),
+                        resolution_type: "explicit_provider".to_string(),
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: explicit_provider.clone(),
+                            model: model_id.clone(),
+                            reason: "provider_disabled_or_unregistered".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_provider".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             let candidate = ModelCandidate {
                 provider: explicit_provider.clone(),
                 model: model_id.clone(),
@@ -139,8 +171,32 @@ impl Router {
             ModelResolution::Explicit { .. } => "explicit_model".to_string(),
         };
 
-        // For explicit model IDs, short-circuit (no filtering/policy).
+        // For explicit model IDs, short-circuit (no capability/priority
+        // filtering) but still enforce the administrative `enabled` switch —
+        // see the identical rationale in Stage 1 above.
         if let ModelResolution::Explicit { ref provider, ref model } = resolved.resolution {
+            if !provider_registry.is_enabled(provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: request.model.clone(),
+                        resolution_type,
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason: "provider_disabled_or_unregistered".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_model".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             return Ok(RoutingPlan {
                 decision: RoutingDecision {
                     timestamp,
@@ -178,28 +234,63 @@ impl Router {
             .collect();
 
         // ─── Stage 4: Filter capability-incompatible ─────────────────────
+        let estimated_tokens = Self::estimate_request_tokens(request);
         let compatible: Vec<ModelCandidate> = available
             .into_iter()
             .filter(|c| {
-                if self.is_compatible(c, request, &resolved.capabilities) {
-                    true
-                } else {
+                if !self.is_compatible(c, request, &resolved.capabilities) {
                     rejection_reasons.push(RejectionRecord {
                         provider: c.provider.clone(),
                         model: c.model.clone(),
                         reason: "missing_required_capability".to_string(),
                     });
-                    false
+                    return false;
                 }
+                if let Some(max_context) = c.max_context_length
+                    && estimated_tokens > max_context
+                {
+                    rejection_reasons.push(RejectionRecord {
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        reason: "context_length_exceeded".to_string(),
+                    });
+                    return false;
+                }
+                true
             })
             .collect();
 
         if compatible.is_empty() {
-            anyhow::bail!(
-                "No compatible providers available for model '{}'. {} candidates rejected.",
-                request.model,
-                rejection_reasons.len()
-            );
+            // Persist why nothing was selected instead of failing before any
+            // RoutingDecision exists — total routing failure is exactly the
+            // case where "why" is most worth keeping (docs/REMEDIATION_PLAN.md
+            // Phase 1.4 / Audit CL02). The caller (route handlers) already
+            // treats an empty `candidates` list as "all providers failed"
+            // via the normal candidate loop, so this doesn't change
+            // response behavior — only what gets recorded.
+            let requested_policy = request
+                .routing
+                .as_ref()
+                .and_then(|r| r.policy.as_ref())
+                .unwrap_or(&self.default_policy)
+                .clone();
+            let rejected_count = rejection_reasons.len() as u32;
+
+            return Ok(RoutingPlan {
+                decision: RoutingDecision {
+                    timestamp,
+                    requested_model: request.model.clone(),
+                    resolution_type,
+                    candidates_considered: rejected_count,
+                    candidates_rejected: rejected_count,
+                    rejection_reasons,
+                    selected_provider: String::new(),
+                    selected_model: String::new(),
+                    policy_applied: requested_policy,
+                    short_circuit: None,
+                },
+                candidates: vec![],
+            });
         }
 
         // ─── Stage 5: Apply routing policy ───────────────────────────────
@@ -210,9 +301,76 @@ impl Router {
             .unwrap_or(&self.default_policy)
             .clone();
 
-        // For V1, "ordered" policy = use candidates in priority order.
-        // Other policies (cheapest, fastest, etc.) are post-V1.
-        let candidates = compatible;
+        let mut candidates = compatible;
+
+        match policy.as_str() {
+            "lowest_latency" => {
+                let statuses = provider_registry.all_statuses();
+                let latency_map: std::collections::HashMap<String, f64> = statuses
+                    .into_iter()
+                    .filter_map(|s| s.avg_latency_ms.map(|l| (s.name, l)))
+                    .collect();
+                
+                candidates.sort_by(|a, b| {
+                    a.priority.cmp(&b.priority).then_with(|| {
+                        let lat_a = latency_map.get(&a.provider).copied().unwrap_or(f64::MAX);
+                        let lat_b = latency_map.get(&b.provider).copied().unwrap_or(f64::MAX);
+                        lat_a.partial_cmp(&lat_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
+            }
+            "round_robin" => {
+                let counter = self.round_robin_counters
+                    .entry(request.model.clone())
+                    .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
+                let offset = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                candidates.sort_by_key(|c| c.priority);
+                
+                // Group by priority and rotate each group
+                if !candidates.is_empty() {
+                    let mut i = 0;
+                    while i < candidates.len() {
+                        let current_priority = candidates[i].priority;
+                        let mut j = i + 1;
+                        while j < candidates.len() && candidates[j].priority == current_priority {
+                            j += 1;
+                        }
+                        
+                        let group_len = j - i;
+                        if group_len > 1 {
+                            let rotation = offset % group_len;
+                            candidates[i..j].rotate_left(rotation);
+                        }
+                        
+                        i = j;
+                    }
+                }
+            }
+            // "priority" is an accepted synonym for "ordered" (both mean
+            // "sort candidates by their configured priority").
+            "ordered" | "priority" => {
+                candidates.sort_by_key(|c| c.priority);
+            }
+            other => {
+                // `GatewayConfig::validate()` only checks that this is one
+                // of the *recognized* policy names, not that it's
+                // implemented — `local_first`/`cheapest`/`fastest`/
+                // `highest_quality`/`balanced` are real `RoutingPolicy`
+                // enum variants with no real dispatch arm here. Previously
+                // any unrecognized-here name (including these) silently
+                // fell back to ordered routing, with no telemetry
+                // distinguishing "policy X requested" from "policy X
+                // applied" (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit
+                // CL03). Silent substitution was the actual defect; failing
+                // loudly here is correct even though it means these five
+                // policies remain unusable until implemented.
+                anyhow::bail!(
+                    "routing policy '{}' is a recognized name but is not yet implemented (only 'ordered', 'round_robin', and 'lowest_latency' have real dispatch logic)",
+                    other
+                );
+            }
+        }
 
         let total_considered = candidates.len() as u32 + rejection_reasons.len() as u32;
 
@@ -269,6 +427,46 @@ impl Router {
         }
 
         true
+    }
+
+    /// Rough token-count estimate for the request's prompt plus its
+    /// requested completion budget, used only for context-window admission
+    /// filtering (Stage 4). This is a heuristic (~4 chars/token), not a real
+    /// tokenizer — no tokenizer dependency exists in this project, and an
+    /// approximate-but-conservative-ish estimate is enough to reject
+    /// obviously-oversized requests before wasting a provider round-trip.
+    /// See docs/ROUTING_AND_POLICIES.md for the documented limitation.
+    fn estimate_request_tokens(request: &GatewayRequest) -> u64 {
+        use crate::types::request::{ContentPart, MessageContent};
+
+        let prompt_chars: u64 = request
+            .messages
+            .as_ref()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|m| m.content.as_ref())
+                    .map(|content| match content {
+                        MessageContent::Text(text) => text.len() as u64,
+                        MessageContent::Parts(parts) => parts
+                            .iter()
+                            .map(|p| match p {
+                                ContentPart::Text { text } => text.len() as u64,
+                                ContentPart::ImageUrl { .. } => 0,
+                            })
+                            .sum(),
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        let prompt_tokens = prompt_chars / 4;
+        let completion_budget = request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(0);
+
+        prompt_tokens + completion_budget
     }
 
     /// Check if the request contains vision/image content.

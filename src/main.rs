@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = TelemetryPipeline::new(
         &config.telemetry,
         db_url.as_deref(),
+        config.pricing.clone(),
     )
     .await?;
 
@@ -121,6 +122,25 @@ async fn main() -> anyhow::Result<()> {
     // ─── Initialize routing engine ───────────────────────────────────────
     let router = RoutingEngine::new(config.routing.default_policy.clone());
 
+    // ─── Initialize the analytics read-pool ──────────────────────────────
+    // A small, separate pool from the telemetry writer's own — analytics
+    // queries are occasional, ad-hoc reads and shouldn't compete with (or
+    // be coupled to the lifecycle of) the write-side batch pipeline.
+    let analytics_pool = match &db_url {
+        Some(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(url)
+            .await
+        {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                tracing::warn!(error = %e, "Analytics endpoints unavailable: could not connect to database");
+                None
+            }
+        },
+        None => None,
+    };
+
     // ─── Build application state ─────────────────────────────────────────
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -129,28 +149,79 @@ async fn main() -> anyhow::Result<()> {
         router,
         telemetry_tx: telemetry.sender(),
         start_time: std::time::Instant::now(),
+        total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        analytics_pool,
     });
 
+    // ─── Snapshot configured models once at startup ───────────────────────
+    //
+    // `model_snapshots` previously existed as schema with no writer at all
+    // (Audit A15). Config is static for the life of the process, so one
+    // snapshot per startup is sufficient provenance for now — a config
+    // reload feature would need to re-emit this.
+    for (name, definition) in &config.models {
+        state.emit_telemetry(ai_gateway::telemetry::TelemetryEvent::ModelSnapshot {
+            timestamp: chrono::Utc::now(),
+            model_name: name.clone(),
+            providers: definition.candidates.iter().map(|c| c.provider.clone()).collect(),
+            capabilities: serde_json::to_value(&definition.capabilities).unwrap_or_default(),
+        });
+    }
+
     // ─── Spawn periodic provider health check worker ─────────────────────
+    //
+    // Holds its own Arc<AppState> clone (and therefore its own telemetry_tx
+    // clone) for as long as it runs. Since this loop never exits on its own,
+    // graceful shutdown must explicitly signal it to stop before the
+    // telemetry channel can ever close (see the shutdown sequence below and
+    // docs/REMEDIATION_PLAN.md Phase 0.5).
     let health_state = state.clone();
-    tokio::spawn(async move {
+    let (health_shutdown_tx, mut health_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let health_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
-            interval.tick().await;
-            let adapters = health_state.provider_registry.all_adapters();
-            for (name, adapter) in adapters {
-                let start = std::time::Instant::now();
-                let health = adapter.health().await;
-                let latency_ms = start.elapsed().as_millis() as u64;
-                health_state.provider_registry.update_health(&name, health);
-                health_state.provider_registry.record_latency(&name, latency_ms);
-                tracing::trace!(provider = %name, ?health, latency_ms, "Provider health check completed");
+            tokio::select! {
+                _ = interval.tick() => {
+                    let adapters = health_state.provider_registry.all_adapters();
+                    for (name, adapter) in adapters {
+                        let start = std::time::Instant::now();
+                        let health = adapter.health().await;
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        health_state.provider_registry.update_health(&name, health);
+                        health_state.provider_registry.record_health_check_latency(&name, latency_ms);
+                        tracing::trace!(provider = %name, ?health, latency_ms, "Provider health check completed");
+                    }
+
+                    // Same rationale as the model snapshot above, for
+                    // `provider_snapshots` — taken on the existing health
+                    // tick rather than a separate timer.
+                    for status in health_state.provider_registry.all_statuses() {
+                        health_state.emit_telemetry(ai_gateway::telemetry::TelemetryEvent::ProviderSnapshot {
+                            timestamp: chrono::Utc::now(),
+                            provider_name: status.name,
+                            provider_type: format!("{:?}", status.provider_type),
+                            health: format!("{:?}", status.health),
+                            total_requests: status.total_requests,
+                            total_errors: status.total_errors,
+                            avg_latency_ms: status.avg_latency_ms,
+                        });
+                    }
+                }
+                _ = &mut health_shutdown_rx => {
+                    tracing::info!("Health check worker shutting down");
+                    return;
+                }
             }
         }
     });
 
     // ─── Build Axum application ──────────────────────────────────────────
-    let app = server::build_router(state);
+    // Keep our own Arc<AppState> clone alive (rather than moving the last
+    // one into the router) so the shutdown sequence below can explicitly
+    // drop it once the server and health worker have both stopped, letting
+    // the telemetry channel close deterministically instead of relying on
+    // process exit to clean it up.
+    let app = server::build_router(state.clone());
 
     // ─── Start server ────────────────────────────────────────────────────
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -180,10 +251,8 @@ async fn main() -> anyhow::Result<()> {
         let _ = drain_tx.send(());
     });
 
-    tokio::select! {
-        res = server_fut => {
-            res?;
-        }
+    let server_result = tokio::select! {
+        res = server_fut => res,
         _ = async {
             if drain_rx.await.is_ok() {
                 tokio::time::sleep(shutdown_timeout).await;
@@ -195,9 +264,26 @@ async fn main() -> anyhow::Result<()> {
                 timeout_secs = config.server.shutdown_timeout_secs,
                 "Graceful shutdown drain timed out; terminating server"
             );
+            Ok(())
         }
-    }
+    };
 
+    // ─── Drain telemetry before exiting ────────────────────────────────
+    //
+    // At this point `app`/`server_fut` have been dropped, releasing their
+    // Arc<AppState> clone. Stop the health worker (it holds its own clone
+    // and would otherwise keep the telemetry channel open forever), drop
+    // our remaining clone, then close the pipeline's own sender and await
+    // the writer task so any buffered batch is flushed rather than
+    // abandoned when the process exits (docs/REMEDIATION_PLAN.md Phase 0.5).
+    let _ = health_shutdown_tx.send(());
+    if let Err(e) = health_task.await {
+        tracing::warn!(error = %e, "Health check worker did not shut down cleanly");
+    }
+    drop(state);
+    telemetry.shutdown().await;
+
+    server_result?;
     tracing::info!("Gateway shutdown complete");
     Ok(())
 }

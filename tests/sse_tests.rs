@@ -63,6 +63,7 @@ fn test_sse_completed_envelope() {
         finish_reason: Some("stop".to_string()),
         provider_response_id: Some("prov-resp-1".to_string()),
         upstream_provider: None,
+        raw_response: None,
     };
 
     let sse_str = event_to_sse(&event, "chatcmpl-test-end", 1700000000, "test-model").expect("Should format SSE");
@@ -70,6 +71,49 @@ fn test_sse_completed_envelope() {
 
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
     assert!(json["choices"][0]["delta"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn test_sse_error_envelope() {
+    // Previously fell into the catch-all `_ => None` and vanished from the
+    // client entirely (Audit A04).
+    let event = ProviderEvent::Error {
+        timestamp: Utc::now(),
+        code: "server_error".to_string(),
+        message: "upstream exploded".to_string(),
+        status_code: Some(503),
+        retryable: true,
+    };
+
+    let sse_str = event_to_sse(&event, "chatcmpl-test-err", 1700000000, "test-model").expect("Should format SSE");
+    let json: serde_json::Value = serde_json::from_str(&sse_str).expect("Should parse as valid JSON");
+
+    assert_eq!(json["error"]["message"], "upstream exploded");
+    assert_eq!(json["error"]["code"], "server_error");
+}
+
+#[test]
+fn test_sse_usage_update_envelope() {
+    // Previously discarded entirely (Audit A08) despite usage being one of
+    // the explicit metrics the gateway exists to capture.
+    let event = ProviderEvent::UsageUpdate {
+        timestamp: Utc::now(),
+        prompt_tokens: Some(10),
+        completion_tokens: Some(20),
+        total_tokens: Some(30),
+        cached_tokens: Some(5),
+        reasoning_tokens: Some(2),
+        raw_usage: None,
+    };
+
+    let sse_str = event_to_sse(&event, "chatcmpl-test-usage", 1700000000, "test-model").expect("Should format SSE");
+    let json: serde_json::Value = serde_json::from_str(&sse_str).expect("Should parse as valid JSON");
+
+    assert_eq!(json["usage"]["prompt_tokens"], 10);
+    assert_eq!(json["usage"]["completion_tokens"], 20);
+    assert_eq!(json["usage"]["total_tokens"], 30);
+    assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
+    assert_eq!(json["usage"]["completion_tokens_details"]["reasoning_tokens"], 2);
 }
 
 #[test]

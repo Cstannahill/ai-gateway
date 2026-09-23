@@ -43,8 +43,17 @@ pub struct GatewayRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
 
-    /// Stop sequences.
+    /// OpenAI's newer replacement for `max_tokens` (o-series models reject
+    /// `max_tokens` and require this instead). Previously silently dropped
+    /// (Audit A08) — accepted and forwarded as-is; if both are present,
+    /// providers see both fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u64>,
+
+    /// Stop sequences. Accepts either a single string or an array of
+    /// strings on the wire — OpenAI's Chat Completions API allows both, and
+    /// a bare string previously failed to deserialize entirely (Audit A08).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
 
     /// Whether to stream the response.
@@ -59,6 +68,11 @@ pub struct GatewayRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
 
+    /// Whether the model may call multiple tools in one turn. Previously
+    /// silently dropped (Audit A08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
     /// Structured output / JSON schema constraint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
@@ -66,6 +80,14 @@ pub struct GatewayRequest {
     /// Reasoning / thinking configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+
+    /// Top-level `reasoning_effort` (OpenAI's o-series field — distinct
+    /// from the nested `reasoning.effort` used by OpenRouter/Anthropic-
+    /// style providers). Previously silently dropped (Audit A08). When
+    /// present without a full `reasoning` object, adapters treat it the
+    /// same as `reasoning.effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 
     /// Requested modalities (text, image, audio, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +140,25 @@ fn generate_request_id() -> Uuid {
     Uuid::now_v7()
 }
 
+/// Accepts `stop` as a JSON `null`, a single string, or an array of
+/// strings, normalizing all three into `Option<Vec<String>>`.
+fn deserialize_stop<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StopValue {
+        Single(String),
+        Many(Vec<String>),
+    }
+
+    Ok(Option::<StopValue>::deserialize(deserializer)?.map(|v| match v {
+        StopValue::Single(s) => vec![s],
+        StopValue::Many(v) => v,
+    }))
+}
+
 impl Default for GatewayRequest {
     fn default() -> Self {
         Self {
@@ -129,12 +170,15 @@ impl Default for GatewayRequest {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_completion_tokens: None,
             stop: None,
             stream: false,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             response_format: None,
             reasoning: None,
+            reasoning_effort: None,
             modalities: None,
             n: None,
             frequency_penalty: None,
@@ -164,11 +208,15 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-/// Message role.
+/// Message role. `Developer` (OpenAI's o-series replacement for `system`)
+/// was previously rejected outright since the enum had no matching variant
+/// (Audit A08) — deserializes/serializes as `"developer"` on the wire and is
+/// forwarded to providers as-is, same as any other role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,

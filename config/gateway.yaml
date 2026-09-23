@@ -54,7 +54,7 @@ providers:
   # huggingface:
   #   name: huggingface
   #   type: hugging_face
-  #   base_url: "https://api-inference.huggingface.co"
+  #   base_url: "https://router.huggingface.co/v1"
   #   api_key_env: HF_API_KEY
 
 # ─── Models ─────────────────────────────────────────────────────────────────
@@ -130,3 +130,13 @@ telemetry:
   flush_interval_ms: 1000
   store_raw_bodies: true
   store_stream_events: true
+  # fallback_log_path: telemetry_fallback.jsonl
+
+# ─── Pricing (optional) ───────────────────────────────────────────────────────
+# Keyed by "provider/model". A deployment with no entry here simply produces
+# no cost_records row — never a fabricated zero cost.
+
+# pricing:
+#   "openrouter/anthropic/claude-sonnet-4":
+#     input_cost_per_1k: 0.003
+#     output_cost_per_1k: 0.015

@@ -1,9 +1,14 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, QueryBuilder};
+use sqlx::{Postgres, QueryBuilder, Transaction};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time;
+
+use crate::config::PricingEntry;
 
 use super::events::{AttemptStatus, TelemetryEvent};
 
@@ -14,13 +19,28 @@ use super::events::{AttemptStatus, TelemetryEvent};
 // NOT in the stream's critical path:
 //   Provider chunk → client (immediate)
 //                  → bounded channel → writer → batch → Postgres (async)
+//
+// Each flush runs as a single transaction (see flush_batch): events that
+// create/update a parent `inference_requests` row are applied before the
+// bulk `stream_events` insert, since `stream_events.request_id` has an
+// immediate foreign key — reversing that order silently dropped chunks for
+// any request whose RequestReceived event landed in the same flush window
+// (docs/REMEDIATION_PLAN.md Phase 0.1 / Audit A02). A failed flush is
+// retried a bounded number of times before falling back to an append-only
+// JSONL log rather than being discarded (Phase 0.3).
+
+const MAX_FLUSH_ATTEMPTS: u32 = 3;
 
 pub struct TelemetryWriter {
-    pool: Option<PgPool>,
+    pool: Option<sqlx::PgPool>,
     batch_size: usize,
     flush_interval: Duration,
     store_raw_bodies: bool,
     store_stream_events: bool,
+    fallback_log_path: PathBuf,
+    /// Deployment pricing, keyed by `"provider/model"`. See
+    /// `GatewayConfig::pricing`'s doc comment.
+    pricing: HashMap<String, PricingEntry>,
 }
 
 impl TelemetryWriter {
@@ -31,6 +51,30 @@ impl TelemetryWriter {
         flush_interval_ms: u64,
         store_raw_bodies: bool,
         store_stream_events: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_fallback_log(
+            database_url,
+            pool_size,
+            batch_size,
+            flush_interval_ms,
+            store_raw_bodies,
+            store_stream_events,
+            "telemetry_fallback.jsonl",
+            HashMap::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_fallback_log(
+        database_url: &str,
+        pool_size: u32,
+        batch_size: usize,
+        flush_interval_ms: u64,
+        store_raw_bodies: bool,
+        store_stream_events: bool,
+        fallback_log_path: impl Into<PathBuf>,
+        pricing: HashMap<String, PricingEntry>,
     ) -> anyhow::Result<Self> {
         let pool = match PgPoolOptions::new()
             .max_connections(pool_size)
@@ -63,6 +107,8 @@ impl TelemetryWriter {
             flush_interval: Duration::from_millis(flush_interval_ms),
             store_raw_bodies,
             store_stream_events,
+            fallback_log_path: fallback_log_path.into(),
+            pricing,
         })
     }
 
@@ -117,73 +163,16 @@ impl TelemetryWriter {
     }
 
     /// Flush a batch of events to PostgreSQL.
+    ///
+    /// Runs the whole batch as one transaction, retries on failure, and
+    /// only as a last resort appends the batch to a local JSONL file rather
+    /// than discarding it (see module docs and Phase 0.2/0.3).
     async fn flush_batch(&self, batch: &mut Vec<TelemetryEvent>) {
         let count = batch.len();
         tracing::debug!(count, "Flushing telemetry batch");
 
-        if let Some(ref pool) = self.pool {
-            // Bulk insert stream chunks if enabled to eliminate N+1 sequential inserts
-            if self.store_stream_events {
-                let stream_chunks: Vec<_> = batch
-                    .iter()
-                    .filter_map(|e| {
-                        if let TelemetryEvent::StreamChunk {
-                            request_id,
-                            attempt_number,
-                            timestamp,
-                            sequence,
-                            chunk_type,
-                            byte_count,
-                        } = e
-                        {
-                            Some((
-                                *request_id,
-                                *attempt_number as i32,
-                                *timestamp,
-                                *sequence as i64,
-                                chunk_type.as_str(),
-                                *byte_count as i32,
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !stream_chunks.is_empty() {
-                    let mut builder: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-                        "INSERT INTO stream_events (request_id, attempt_number, timestamp, sequence, chunk_type, byte_count) ",
-                    );
-                    builder.push_values(stream_chunks, |mut b, (req_id, attempt, ts, seq, c_type, bytes)| {
-                        b.push_bind(req_id)
-                            .push_bind(attempt)
-                            .push_bind(ts)
-                            .push_bind(seq)
-                            .push_bind(c_type)
-                            .push_bind(bytes);
-                    });
-                    if let Err(e) = builder.build().execute(pool).await {
-                        tracing::error!(error = %e, "Failed to bulk persist stream_events");
-                    }
-                }
-            }
-
-            // Persist remaining (lifecycle/usage/content) events
-            for event in batch.iter() {
-                if matches!(event, TelemetryEvent::StreamChunk { .. }) {
-                    continue;
-                }
-                if let Err(e) = self.persist_event(pool, event).await {
-                    tracing::error!(
-                        error = %e,
-                        event_type = %event.event_type(),
-                        request_id = %event.request_id(),
-                        "Failed to persist telemetry event to database"
-                    );
-                }
-            }
-        } else {
-            // Log-only fallback
+        let Some(ref pool) = self.pool else {
+            // Log-only fallback (no database configured).
             for event in batch.iter() {
                 tracing::debug!(
                     event_type = %event.event_type(),
@@ -191,18 +180,156 @@ impl TelemetryWriter {
                     "Persisting telemetry event (log-only)"
                 );
             }
+            batch.clear();
+            return;
+        };
+
+        let mut last_error = None;
+        for attempt in 0..MAX_FLUSH_ATTEMPTS {
+            match self.try_flush_batch_transactional(pool, batch).await {
+                Ok(()) => {
+                    batch.clear();
+                    tracing::debug!(count, "Telemetry batch flushed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_FLUSH_ATTEMPTS,
+                        "Failed to flush telemetry batch"
+                    );
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_FLUSH_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                    }
+                }
+            }
         }
 
+        tracing::error!(
+            count,
+            error = ?last_error,
+            path = %self.fallback_log_path.display(),
+            "Telemetry batch failed after all retries; writing to fallback log instead of discarding"
+        );
+        if let Err(e) = self.write_fallback_log(batch).await {
+            tracing::error!(
+                error = %e,
+                count,
+                "Failed to write telemetry fallback log — these events are lost"
+            );
+        }
         batch.clear();
-        tracing::debug!(count, "Telemetry batch flushed");
     }
 
-    /// Persist a single event into the appropriate relational table.
-    async fn persist_event(&self, pool: &PgPool, event: &TelemetryEvent) -> anyhow::Result<()> {
+    /// Attempt to persist an entire batch inside a single transaction.
+    ///
+    /// Order matters: events that create/update the parent `inference_requests`
+    /// row (everything except `StreamChunk`) are applied first, in their
+    /// original relative order, and the `StreamChunk` bulk insert runs last —
+    /// so a request whose `RequestReceived` and chunk events land in the same
+    /// flush window always has its parent row in place before the FK-checked
+    /// bulk insert runs (Audit A02 / CL05).
+    async fn try_flush_batch_transactional(
+        &self,
+        pool: &sqlx::PgPool,
+        batch: &[TelemetryEvent],
+    ) -> anyhow::Result<()> {
+        let mut tx = pool.begin().await?;
+
+        for event in batch.iter() {
+            if matches!(event, TelemetryEvent::StreamChunk { .. }) {
+                continue;
+            }
+            self.persist_event(&mut tx, event).await?;
+        }
+
+        if self.store_stream_events {
+            let stream_chunks: Vec<_> = batch
+                .iter()
+                .filter_map(|e| {
+                    if let TelemetryEvent::StreamChunk {
+                        request_id,
+                        attempt_number,
+                        timestamp,
+                        sequence,
+                        chunk_type,
+                        byte_count,
+                        synthetic,
+                    } = e
+                    {
+                        Some((
+                            *request_id,
+                            *attempt_number as i32,
+                            *timestamp,
+                            *sequence as i64,
+                            chunk_type.as_str(),
+                            *byte_count as i32,
+                            *synthetic,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !stream_chunks.is_empty() {
+                let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                    "INSERT INTO stream_events (request_id, attempt_number, timestamp, sequence, chunk_type, byte_count, synthetic) ",
+                );
+                builder.push_values(stream_chunks, |mut b, (req_id, attempt, ts, seq, c_type, bytes, synthetic)| {
+                    b.push_bind(req_id)
+                        .push_bind(attempt)
+                        .push_bind(ts)
+                        .push_bind(seq)
+                        .push_bind(c_type)
+                        .push_bind(bytes)
+                        .push_bind(synthetic);
+                });
+                builder.build().execute(&mut *tx).await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Last-resort durability backstop: append the whole failed batch to a
+    /// local JSONL file, one event per line, instead of losing it silently.
+    /// This is not a full durable outbox (no replay-on-recovery yet — see
+    /// docs/REMEDIATION_PLAN.md Phase 5.1) but it turns "Postgres was down"
+    /// into "these events need manual/automated replay" instead of
+    /// "these generations never existed".
+    async fn write_fallback_log(&self, batch: &[TelemetryEvent]) -> anyhow::Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.fallback_log_path)
+            .await?;
+
+        let mut buf = String::new();
+        for event in batch {
+            buf.push_str(&serde_json::to_string(event)?);
+            buf.push('\n');
+        }
+        file.write_all(buf.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Persist a single event into the appropriate relational table, as
+    /// part of the caller's transaction.
+    async fn persist_event(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        event: &TelemetryEvent,
+    ) -> anyhow::Result<()> {
         match event {
             TelemetryEvent::RequestReceived {
                 request_id,
                 timestamp,
+                client_correlation_id,
                 application,
                 task,
                 tags,
@@ -221,29 +348,28 @@ impl TelemetryWriter {
                     None
                 };
 
+                // `request_id` is the gateway-generated primary key and is
+                // never overwritten by ON CONFLICT — a client reusing the
+                // same `client_correlation_id` (e.g. a stale x-request-id
+                // header) across distinct requests must not merge their
+                // data. Each request_id is unique per gateway-generated
+                // UUIDv7, so this INSERT should never actually conflict in
+                // normal operation; ON CONFLICT DO NOTHING here only guards
+                // against a duplicate RequestReceived for the same request
+                // (e.g. a retried telemetry send), not against ID reuse.
                 sqlx::query(
                     r#"
                     INSERT INTO inference_requests (
-                        request_id, received_at, application, task, requested_model,
-                        streaming, uses_tools, uses_vision, uses_structured_output, uses_reasoning,
-                        canonical_messages, raw_request
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                    ON CONFLICT (request_id) DO UPDATE SET
-                        received_at = EXCLUDED.received_at,
-                        application = COALESCE(EXCLUDED.application, inference_requests.application),
-                        task = COALESCE(EXCLUDED.task, inference_requests.task),
-                        requested_model = EXCLUDED.requested_model,
-                        streaming = EXCLUDED.streaming,
-                        uses_tools = EXCLUDED.uses_tools,
-                        uses_vision = EXCLUDED.uses_vision,
-                        uses_structured_output = EXCLUDED.uses_structured_output,
-                        uses_reasoning = EXCLUDED.uses_reasoning,
-                        canonical_messages = COALESCE(EXCLUDED.canonical_messages, inference_requests.canonical_messages),
-                        raw_request = COALESCE(EXCLUDED.raw_request, inference_requests.raw_request)
+                        request_id, received_at, client_correlation_id, application, task,
+                        requested_model, streaming, uses_tools, uses_vision,
+                        uses_structured_output, uses_reasoning, canonical_messages, raw_request
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    ON CONFLICT (request_id) DO NOTHING
                     "#,
                 )
                 .bind(request_id)
                 .bind(timestamp)
+                .bind(client_correlation_id)
                 .bind(application)
                 .bind(task)
                 .bind(requested_model)
@@ -254,17 +380,17 @@ impl TelemetryWriter {
                 .bind(uses_reasoning)
                 .bind(canonical_messages)
                 .bind(raw_req)
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
 
                 for tag in tags {
-                    let _ = sqlx::query(
+                    sqlx::query(
                         r#"INSERT INTO request_tags (request_id, tag) VALUES ($1, $2)"#,
                     )
                     .bind(request_id)
                     .bind(tag)
-                    .execute(pool)
-                    .await;
+                    .execute(&mut **tx)
+                    .await?;
                 }
             }
 
@@ -274,13 +400,13 @@ impl TelemetryWriter {
                 decision,
             } => {
                 // Ensure parent record exists
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"INSERT INTO inference_requests (request_id, requested_model) VALUES ($1, $2) ON CONFLICT (request_id) DO NOTHING"#,
                 )
                 .bind(request_id)
                 .bind(&decision.requested_model)
-                .execute(pool)
-                .await;
+                .execute(&mut **tx)
+                .await?;
 
                 let rejection_reasons = serde_json::to_value(&decision.rejection_reasons).ok();
 
@@ -304,7 +430,7 @@ impl TelemetryWriter {
                 .bind(&decision.selected_model)
                 .bind(&decision.policy_applied)
                 .bind(&decision.short_circuit)
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
             }
 
@@ -315,13 +441,13 @@ impl TelemetryWriter {
                 provider,
                 model,
             } => {
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"INSERT INTO inference_requests (request_id, requested_model) VALUES ($1, $2) ON CONFLICT (request_id) DO NOTHING"#,
                 )
                 .bind(request_id)
                 .bind(model)
-                .execute(pool)
-                .await;
+                .execute(&mut **tx)
+                .await?;
 
                 sqlx::query(
                     r#"
@@ -335,7 +461,7 @@ impl TelemetryWriter {
                 .bind(timestamp)
                 .bind(provider)
                 .bind(model)
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
             }
 
@@ -345,7 +471,7 @@ impl TelemetryWriter {
                 connection_latency_us,
                 ..
             } => {
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"
                     UPDATE provider_attempts
                     SET connection_latency_us = $3
@@ -355,40 +481,65 @@ impl TelemetryWriter {
                 .bind(request_id)
                 .bind(*attempt_number as i32)
                 .bind(*connection_latency_us as i64)
-                .execute(pool)
-                .await;
+                .execute(&mut **tx)
+                .await?;
             }
 
-            TelemetryEvent::FirstProviderByte { .. } => {}
-
-            TelemetryEvent::FirstGenerationChunk { .. } => {}
-
-            TelemetryEvent::StreamChunk {
+            TelemetryEvent::FirstProviderByte {
                 request_id,
                 attempt_number,
                 timestamp,
-                sequence,
-                chunk_type,
-                byte_count,
+                synthetic,
             } => {
-                if self.store_stream_events {
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO stream_events (
-                            request_id, attempt_number, timestamp, sequence, chunk_type, byte_count
-                        ) VALUES ($1, $2, $3, $4, $5, $6)
-                        "#,
-                    )
-                    .bind(request_id)
-                    .bind(*attempt_number as i32)
-                    .bind(timestamp)
-                    .bind(*sequence as i64)
-                    .bind(chunk_type)
-                    .bind(*byte_count as i32)
-                    .execute(pool)
-                    .await;
-                }
+                // `synthetic_timing` is sticky (OR'd, never cleared) since
+                // either of this attempt's two timing signals being
+                // fabricated is enough to disqualify the whole attempt from
+                // real TTFB/TTFT analysis (docs/REMEDIATION_PLAN.md Phase
+                // 3.1 / Audit A06).
+                sqlx::query(
+                    r#"
+                    UPDATE provider_attempts
+                    SET first_byte_at = $3,
+                        synthetic_timing = synthetic_timing OR $4
+                    WHERE request_id = $1 AND attempt_number = $2 AND first_byte_at IS NULL
+                    "#,
+                )
+                .bind(request_id)
+                .bind(*attempt_number as i32)
+                .bind(timestamp)
+                .bind(synthetic)
+                .execute(&mut **tx)
+                .await?;
             }
+
+            TelemetryEvent::FirstGenerationChunk {
+                request_id,
+                attempt_number,
+                timestamp,
+                synthetic,
+                ..
+            } => {
+                sqlx::query(
+                    r#"
+                    UPDATE provider_attempts
+                    SET first_token_at = $3,
+                        synthetic_timing = synthetic_timing OR $4
+                    WHERE request_id = $1 AND attempt_number = $2 AND first_token_at IS NULL
+                    "#,
+                )
+                .bind(request_id)
+                .bind(*attempt_number as i32)
+                .bind(timestamp)
+                .bind(synthetic)
+                .execute(&mut **tx)
+                .await?;
+            }
+
+            // Never reached: try_flush_batch_transactional filters
+            // StreamChunk events out before calling persist_event and
+            // bulk-inserts them separately (see that function's doc comment
+            // for why the ordering matters).
+            TelemetryEvent::StreamChunk { .. } => {}
 
             TelemetryEvent::ProviderAttemptCompleted {
                 request_id,
@@ -432,12 +583,12 @@ impl TelemetryWriter {
                 .bind(*duration_us as i64)
                 .bind(error_code.as_deref())
                 .bind(error_message.as_deref())
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
 
                 // If attempt was not pre-inserted, insert now
                 if res.rows_affected() == 0 {
-                    let _ = sqlx::query(
+                    sqlx::query(
                         r#"
                         INSERT INTO provider_attempts (
                             request_id, attempt_number, timestamp, provider, model, status,
@@ -456,13 +607,13 @@ impl TelemetryWriter {
                     .bind(*duration_us as i64)
                     .bind(error_code.as_deref())
                     .bind(error_message.as_deref())
-                    .execute(pool)
-                    .await;
+                    .execute(&mut **tx)
+                    .await?;
                 }
 
                 // If there's an error code, record in errors table
                 if let Some(code) = error_code {
-                    let _ = sqlx::query(
+                    sqlx::query(
                         r#"
                         INSERT INTO errors (
                             request_id, attempt_number, timestamp, error_code, error_message
@@ -474,8 +625,8 @@ impl TelemetryWriter {
                     .bind(timestamp)
                     .bind(code)
                     .bind(error_message.as_deref())
-                    .execute(pool)
-                    .await;
+                    .execute(&mut **tx)
+                    .await?;
                 }
             }
 
@@ -502,8 +653,64 @@ impl TelemetryWriter {
                 .bind(usage.cached_tokens.map(|v| v as i64))
                 .bind(usage.reasoning_tokens.map(|v| v as i64))
                 .bind(&usage.raw_provider_usage)
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
+
+                // Covers the ordering where usage arrives after the
+                // generation was already persisted as `none` — see the
+                // matching comment in the GenerationContent branch above.
+                if usage.reasoning_tokens.is_some_and(|t| t > 0) {
+                    sqlx::query(
+                        r#"
+                        UPDATE generations
+                        SET reasoning_visibility = 'count_only'
+                        WHERE request_id = $1 AND attempt_number = $2 AND reasoning_visibility = 'none'
+                        "#,
+                    )
+                    .bind(request_id)
+                    .bind(*attempt_number as i32)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+
+                // Compute and persist cost if this attempt's provider/model
+                // has a configured price — previously `cost_records` had no
+                // producer at all regardless of configuration
+                // (docs/REMEDIATION_PLAN.md Phase 3.5 / Audit A15/A17).
+                if !self.pricing.is_empty() {
+                    let deployment: Option<(String, String)> = sqlx::query_as(
+                        r#"SELECT provider, model FROM provider_attempts WHERE request_id = $1 AND attempt_number = $2"#,
+                    )
+                    .bind(request_id)
+                    .bind(*attempt_number as i32)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+
+                    if let Some((provider, model)) = deployment
+                        && let Some(price) = self.pricing.get(&format!("{provider}/{model}"))
+                    {
+                        let input_cost = (usage.prompt_tokens as f64 / 1000.0) * price.input_cost_per_1k;
+                        let output_cost = (usage.completion_tokens as f64 / 1000.0) * price.output_cost_per_1k;
+
+                        sqlx::query(
+                            r#"
+                            INSERT INTO cost_records (
+                                request_id, timestamp, estimated_cost, currency, provider, model,
+                                input_cost, output_cost
+                            ) VALUES ($1, $2, $3, 'USD', $4, $5, $6, $7)
+                            "#,
+                        )
+                        .bind(request_id)
+                        .bind(timestamp)
+                        .bind(input_cost + output_cost)
+                        .bind(&provider)
+                        .bind(&model)
+                        .bind(input_cost)
+                        .bind(output_cost)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                }
             }
 
             TelemetryEvent::GenerationContent {
@@ -521,10 +728,36 @@ impl TelemetryWriter {
                     None
                 };
 
+                // Distinguish "the model didn't reason" from "reasoning
+                // happened but no text was exposed" — previously any
+                // absent `reasoning_content` was written as `none`
+                // regardless of whether reasoning tokens were reported,
+                // conflating the two cases the `ReasoningVisibility` type
+                // exists specifically to keep apart (Audit A07). If a
+                // `UsageRecorded` event for this attempt already landed
+                // with reasoning_tokens > 0, mark it `count_only` instead;
+                // the reverse ordering (usage arriving after this insert)
+                // is handled in the UsageRecorded branch below.
                 let visibility = if reasoning_content.is_some() {
                     "exposed"
                 } else {
-                    "none"
+                    let reasoning_tokens_reported: Option<i64> = sqlx::query_scalar(
+                        r#"
+                        SELECT reasoning_tokens FROM generation_usage
+                        WHERE request_id = $1 AND attempt_number = $2 AND reasoning_tokens > 0
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(request_id)
+                    .bind(*attempt_number as i32)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+
+                    if reasoning_tokens_reported.is_some() {
+                        "count_only"
+                    } else {
+                        "none"
+                    }
                 };
 
                 sqlx::query(
@@ -543,7 +776,7 @@ impl TelemetryWriter {
                 .bind(visibility)
                 .bind(tool_calls)
                 .bind(raw_resp)
-                .execute(pool)
+                .execute(&mut **tx)
                 .await?;
 
                 // Also populate tool_calls table if structured tool calls exist
@@ -560,7 +793,7 @@ impl TelemetryWriter {
                             .or_else(|| tc.get("function").and_then(|f| f.get("arguments")).map(|_| ""))
                             .unwrap_or("");
 
-                        let _ = sqlx::query(
+                        sqlx::query(
                             r#"
                             INSERT INTO tool_calls (
                                 request_id, attempt_number, tool_call_id, function_name, arguments
@@ -572,8 +805,8 @@ impl TelemetryWriter {
                         .bind(tc_id)
                         .bind(fn_name)
                         .bind(fn_args)
-                        .execute(pool)
-                        .await;
+                        .execute(&mut **tx)
+                        .await?;
                     }
                 }
             }
@@ -585,7 +818,7 @@ impl TelemetryWriter {
                 actual_cost,
                 currency,
             } => {
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"
                     INSERT INTO cost_records (
                         request_id, timestamp, estimated_cost, actual_cost, currency
@@ -597,8 +830,8 @@ impl TelemetryWriter {
                 .bind(estimated_cost)
                 .bind(actual_cost)
                 .bind(currency)
-                .execute(pool)
-                .await;
+                .execute(&mut **tx)
+                .await?;
             }
 
             TelemetryEvent::RequestCompleted {
@@ -610,7 +843,7 @@ impl TelemetryWriter {
                 resolved_model,
                 success,
             } => {
-                let _ = sqlx::query(
+                sqlx::query(
                     r#"
                     UPDATE inference_requests
                     SET completed_at = $2,
@@ -629,8 +862,56 @@ impl TelemetryWriter {
                 .bind(serving_provider.as_deref())
                 .bind(resolved_model.as_deref())
                 .bind(success)
-                .execute(pool)
-                .await;
+                .execute(&mut **tx)
+                .await?;
+            }
+
+            TelemetryEvent::ModelSnapshot {
+                timestamp,
+                model_name,
+                providers,
+                capabilities,
+            } => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO model_snapshots (snapshot_at, model_name, providers, capabilities)
+                    VALUES ($1, $2, $3, $4)
+                    "#,
+                )
+                .bind(timestamp)
+                .bind(model_name)
+                .bind(serde_json::to_value(providers).ok())
+                .bind(capabilities)
+                .execute(&mut **tx)
+                .await?;
+            }
+
+            TelemetryEvent::ProviderSnapshot {
+                timestamp,
+                provider_name,
+                provider_type,
+                health,
+                total_requests,
+                total_errors,
+                avg_latency_ms,
+            } => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO provider_snapshots (
+                        snapshot_at, provider_name, provider_type, health,
+                        total_requests, total_errors, avg_latency_ms
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    "#,
+                )
+                .bind(timestamp)
+                .bind(provider_name)
+                .bind(provider_type)
+                .bind(health)
+                .bind(*total_requests as i64)
+                .bind(*total_errors as i64)
+                .bind(avg_latency_ms)
+                .execute(&mut **tx)
+                .await?;
             }
         }
 

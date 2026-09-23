@@ -107,7 +107,16 @@ pub struct ProviderStatus {
     /// Total errors since startup.
     pub total_errors: u64,
 
-    /// Average latency in ms (rolling window).
+    /// Average *inference* latency in ms — recorded per completed request
+    /// attempt, not per background health probe. Previously this field was
+    /// fed by both, so `lowest_latency` routing and `/metrics` were mostly
+    /// reflecting `/models` health-check timing rather than actual
+    /// inference latency (docs/REMEDIATION_PLAN.md Phase 3.3 / Audit A13).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_latency_ms: Option<f64>,
+
+    /// Average background health-probe latency in ms — informational only,
+    /// never used for routing decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_health_check_latency_ms: Option<f64>,
 }

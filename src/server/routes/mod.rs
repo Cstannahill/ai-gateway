@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod health;
@@ -28,4 +29,20 @@ pub fn management_routes() -> Router<Arc<AppState>> {
         .route("/health", get(health::handle))
         .route("/providers", get(providers::handle))
         .route("/metrics", get(metrics::handle))
+}
+
+/// Read-only analytics query routes over the telemetry schema
+/// (docs/REMEDIATION_PLAN.md Phase 4 item 1). Every handler degrades to
+/// `503` if no database is configured/reachable — see
+/// `analytics::require_pool`.
+pub fn analytics_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/analytics/requests", get(analytics::list_requests))
+        .route("/v1/analytics/requests/{request_id}", get(analytics::get_request))
+        .route(
+            "/v1/analytics/requests/{request_id}/timeline",
+            get(analytics::get_request_timeline),
+        )
+        .route("/v1/analytics/providers/comparison", get(analytics::provider_comparison))
+        .route("/v1/analytics/fallbacks", get(analytics::fallback_analysis))
 }
