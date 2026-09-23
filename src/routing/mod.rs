@@ -139,6 +139,32 @@ impl Router {
                 });
             }
 
+            // A configured `max_concurrent` ceiling is a resource-protection
+            // constraint, not a routing preference — same rationale as the
+            // `enabled` check above, it must not be bypassable by explicit
+            // addressing (docs/REMEDIATION_PLAN.md Phase 5.3).
+            if provider_registry.is_at_capacity(explicit_provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: model_id.clone(),
+                        resolution_type: "explicit_provider".to_string(),
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: explicit_provider.clone(),
+                            model: model_id.clone(),
+                            reason: "provider_at_capacity".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_provider".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             let candidate = ModelCandidate {
                 provider: explicit_provider.clone(),
                 model: model_id.clone(),
@@ -197,6 +223,30 @@ impl Router {
                 });
             }
 
+            // See the identical rationale in Stage 1's capacity check above
+            // (docs/REMEDIATION_PLAN.md Phase 5.3).
+            if provider_registry.is_at_capacity(provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: request.model.clone(),
+                        resolution_type,
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason: "provider_at_capacity".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_model".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             return Ok(RoutingPlan {
                 decision: RoutingDecision {
                     timestamp,
@@ -220,16 +270,28 @@ impl Router {
             .candidates
             .into_iter()
             .filter(|c| {
-                if provider_registry.is_available(&c.provider) {
-                    true
-                } else {
+                if !provider_registry.is_available(&c.provider) {
                     rejection_reasons.push(RejectionRecord {
                         provider: c.provider.clone(),
                         model: c.model.clone(),
                         reason: "provider_unavailable".to_string(),
                     });
-                    false
+                    return false;
                 }
+                // A configured `max_concurrent` ceiling gets its own
+                // rejection reason, distinct from "unavailable" — this is
+                // transient load, not a config/health problem, and a
+                // caller/dashboard should be able to tell them apart
+                // (docs/REMEDIATION_PLAN.md Phase 5.3).
+                if provider_registry.is_at_capacity(&c.provider) {
+                    rejection_reasons.push(RejectionRecord {
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        reason: "provider_at_capacity".to_string(),
+                    });
+                    return false;
+                }
+                true
             })
             .collect();
 

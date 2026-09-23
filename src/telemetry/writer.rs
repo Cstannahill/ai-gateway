@@ -27,7 +27,10 @@ use super::events::{AttemptStatus, TelemetryEvent};
 // any request whose RequestReceived event landed in the same flush window
 // (docs/REMEDIATION_PLAN.md Phase 0.1 / Audit A02). A failed flush is
 // retried a bounded number of times before falling back to an append-only
-// JSONL log rather than being discarded (Phase 0.3).
+// JSONL log rather than being discarded (Phase 0.3); that log is itself
+// replayed automatically on writer startup and on every subsequent flush
+// tick, so an extended outage drains itself once Postgres recovers,
+// without operator intervention (see `replay_fallback_log`, Phase 5.1).
 
 const MAX_FLUSH_ATTEMPTS: u32 = 3;
 
@@ -101,7 +104,7 @@ impl TelemetryWriter {
             }
         };
 
-        Ok(Self {
+        let writer = Self {
             pool,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
@@ -109,7 +112,16 @@ impl TelemetryWriter {
             store_stream_events,
             fallback_log_path: fallback_log_path.into(),
             pricing,
-        })
+        };
+
+        // A prior run (this process restarting, or an entirely separate
+        // one against the same fallback log path) may have left events
+        // behind from an outage that has since ended — replay them now
+        // rather than requiring an operator to notice and intervene
+        // manually (docs/REMEDIATION_PLAN.md Phase 5.1).
+        writer.replay_fallback_log().await;
+
+        Ok(writer)
     }
 
     /// Run the writer loop — receives events and batches them for persistence.
@@ -152,8 +164,14 @@ impl TelemetryWriter {
                         }
                     }
                 }
-                // Periodic flush for low-throughput periods.
+                // Periodic flush for low-throughput periods. Also the
+                // heartbeat for retrying any backlog left in the fallback
+                // log by an earlier outage — an extended Postgres outage
+                // that later recovers gets drained automatically on this
+                // same cadence, without needing a process restart
+                // (docs/REMEDIATION_PLAN.md Phase 5.1).
                 _ = flush_interval.tick() => {
+                    self.replay_fallback_log().await;
                     if !batch.is_empty() {
                         self.flush_batch(&mut batch).await;
                     }
@@ -295,12 +313,17 @@ impl TelemetryWriter {
         Ok(())
     }
 
-    /// Last-resort durability backstop: append the whole failed batch to a
-    /// local JSONL file, one event per line, instead of losing it silently.
-    /// This is not a full durable outbox (no replay-on-recovery yet — see
-    /// docs/REMEDIATION_PLAN.md Phase 5.1) but it turns "Postgres was down"
-    /// into "these events need manual/automated replay" instead of
-    /// "these generations never existed".
+    /// Durability backstop: append the whole failed batch to a local JSONL
+    /// file, one event per line, instead of losing it silently. Paired
+    /// with `replay_fallback_log` (called on construction and on every
+    /// periodic flush tick), this makes "Postgres was down" degrade to
+    /// "these events are delayed" rather than requiring manual recovery or
+    /// risking loss on process restart (docs/REMEDIATION_PLAN.md Phase
+    /// 5.1). Not a full write-ahead-logged outbox — events are journaled
+    /// only after the in-memory batch already failed its DB attempts, not
+    /// before every write — so a hard process crash between receiving an
+    /// event and a failed flush can still lose it. See the matching note
+    /// in docs/ARCHITECTURE.md's Step 4.
     async fn write_fallback_log(&self, batch: &[TelemetryEvent]) -> anyhow::Result<()> {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -316,6 +339,107 @@ impl TelemetryWriter {
         file.write_all(buf.as_bytes()).await?;
         file.flush().await?;
         Ok(())
+    }
+
+    /// Replay any events left in the fallback log by an earlier outage.
+    /// Reads the whole file, parses each line as a `TelemetryEvent`
+    /// (skipping and warning on any line that fails to parse — e.g. a
+    /// partially written line from a crash mid-append — rather than
+    /// blocking replay of everything else), and flushes them through the
+    /// normal transactional path in `batch_size`-sized chunks. Only
+    /// removes the file once every parsed event has been persisted; on a
+    /// failure partway through, rewrites the file with just what's left so
+    /// a later attempt (the next tick, or the next process start) resumes
+    /// instead of reprocessing already-persisted events. A no-op if there
+    /// is no database configured or no file exists.
+    async fn replay_fallback_log(&self) {
+        let Some(ref pool) = self.pool else { return };
+
+        let contents = match tokio::fs::read_to_string(&self.fallback_log_path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %self.fallback_log_path.display(),
+                    "Could not read telemetry fallback log for replay"
+                );
+                return;
+            }
+        };
+
+        if contents.trim().is_empty() {
+            return;
+        }
+
+        let mut events = Vec::new();
+        let mut malformed = 0u32;
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<TelemetryEvent>(line) {
+                Ok(event) => events.push(event),
+                Err(_) => malformed += 1,
+            }
+        }
+        if malformed > 0 {
+            tracing::warn!(
+                malformed,
+                path = %self.fallback_log_path.display(),
+                "Skipped malformed lines while replaying telemetry fallback log"
+            );
+        }
+        if events.is_empty() {
+            // Nothing parseable survived (e.g. the file was only ever
+            // malformed lines) — clear it so this doesn't spin forever.
+            let _ = tokio::fs::remove_file(&self.fallback_log_path).await;
+            return;
+        }
+
+        tracing::info!(count = events.len(), "Replaying telemetry fallback log");
+
+        let mut remaining = events;
+        while !remaining.is_empty() {
+            let chunk_len = remaining.len().min(self.batch_size.max(1));
+            let chunk: Vec<TelemetryEvent> = remaining.drain(..chunk_len).collect();
+            if let Err(e) = self.try_flush_batch_transactional(pool, &chunk).await {
+                tracing::warn!(
+                    error = %e,
+                    remaining = chunk.len() + remaining.len(),
+                    "Telemetry fallback log replay stalled; will retry on the next tick"
+                );
+                // Put the failed chunk back in front of whatever else was
+                // still pending, then stop — the DB is presumably still
+                // unhappy, so further chunks would likely fail too.
+                remaining.splice(0..0, chunk);
+                break;
+            }
+        }
+
+        if remaining.is_empty() {
+            if let Err(e) = tokio::fs::remove_file(&self.fallback_log_path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %e, "Replayed telemetry fallback log but could not remove it");
+            }
+            tracing::info!("Telemetry fallback log fully replayed and cleared");
+        } else {
+            let mut buf = String::new();
+            for event in &remaining {
+                if let Ok(s) = serde_json::to_string(event) {
+                    buf.push_str(&s);
+                    buf.push('\n');
+                }
+            }
+            if let Err(e) = tokio::fs::write(&self.fallback_log_path, buf).await {
+                tracing::error!(
+                    error = %e,
+                    "Failed to rewrite telemetry fallback log after partial replay — \
+                     already-persisted events may be replayed again on the next attempt"
+                );
+            }
+        }
     }
 
     /// Persist a single event into the appropriate relational table, as

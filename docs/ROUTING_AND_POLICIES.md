@@ -105,7 +105,9 @@ The router queries [`ModelRegistry::resolve`](file:///s:/Code/RustProjects/AI-Ga
 Every candidate's provider status is checked against [`ProviderRegistry::is_available`](file:///s:/Code/RustProjects/AI-Gateway/src/registry/provider_registry.rs#L82):
 - Must have `enabled: true` in configuration.
 - Must not be flagged as `ProviderHealth::Unhealthy` by the background health check worker.
-- Rejected candidates are tracked with reason: `"Provider 'X' is unavailable or unhealthy"`.
+- Rejected candidates are tracked with reason `"provider_unavailable"`.
+
+A second, independent check follows: if the provider has a configured `max_concurrent`, its current in-flight request count (tracked by `ProviderRegistry::record_request_start`/`record_request_end`) must be below that limit, or the candidate is rejected with reason `"provider_at_capacity"` — a distinct reason from `"provider_unavailable"` since it's transient load, not a config/health problem. This check also applies to explicit `provider/model` addressing (Stage 1/2's short-circuits): `max_concurrent` is a resource-protection constraint, not a routing preference, so — like the administrative `enabled` switch — it is not bypassable by explicit addressing (docs/REMEDIATION_PLAN.md Phase 5.3).
 
 ### Stage 4: Capability Matching
 The request's requirements are dynamically checked against candidate capabilities:

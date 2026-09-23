@@ -69,6 +69,71 @@ fn attempt_started(request_id: Uuid, provider: &str, model: &str) -> TelemetryEv
 }
 
 #[tokio::test]
+async fn fallback_log_is_replayed_and_cleared_on_writer_startup() {
+    // Simulates a prior process's outage: events that never made it to
+    // Postgres were journaled to a JSONL fallback file, and that file is
+    // still sitting on disk when a new `TelemetryWriter` starts up with a
+    // now-reachable database. Constructing the writer must replay and
+    // clear it automatically — this is the "no risk of loss, replays on
+    // recovery" half of docs/REMEDIATION_PLAN.md Phase 5.1 that the
+    // original minimal fallback-file stopgap (Phase 0.3) didn't cover:
+    // nothing previously ever read this file back.
+    let Ok(url) = std::env::var("AUDIT_DATABASE_URL") else {
+        eprintln!("skipping fallback_log_is_replayed_and_cleared_on_writer_startup: AUDIT_DATABASE_URL not set");
+        return;
+    };
+
+    let fallback_path = std::env::temp_dir().join(format!("ai-gateway-fallback-test-{}.jsonl", Uuid::now_v7()));
+
+    let stranded_a = Uuid::now_v7();
+    let stranded_b = Uuid::now_v7();
+    let mut lines = String::new();
+    lines.push_str(&serde_json::to_string(&request_received(stranded_a, "stranded-model")).unwrap());
+    lines.push('\n');
+    lines.push_str(&serde_json::to_string(&attempt_started(stranded_a, "stranded-provider", "stranded-model")).unwrap());
+    lines.push('\n');
+    // A garbage line (e.g. from a crash mid-append) must not block replay
+    // of everything else in the file.
+    lines.push_str("{not valid json\n");
+    lines.push_str(&serde_json::to_string(&request_received(stranded_b, "stranded-model")).unwrap());
+    lines.push('\n');
+    tokio::fs::write(&fallback_path, lines).await.unwrap();
+
+    let writer = TelemetryWriter::new_with_fallback_log(
+        &url,
+        2,
+        100,
+        60_000,
+        true,
+        true,
+        fallback_path.clone(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    // Replay happens synchronously inside `new_with_fallback_log`, before
+    // it returns — no need to run the writer loop for this assertion.
+    assert!(
+        !fallback_path.exists(),
+        "fallback log should have been replayed and removed"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM inference_requests WHERE request_id = ANY($1)")
+        .bind([stranded_a, stranded_b])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "both stranded requests should have been replayed into the database");
+
+    // Let the writer's own receiver channel close cleanly.
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(tx);
+    writer.run(rx).await;
+}
+
+#[tokio::test]
 async fn reasoning_visibility_is_correct_regardless_of_event_order() {
     let Some((writer, pool)) = writer_and_pool().await else {
         eprintln!("skipping reasoning_visibility_is_correct_regardless_of_event_order: AUDIT_DATABASE_URL not set");

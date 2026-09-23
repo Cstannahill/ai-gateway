@@ -100,6 +100,23 @@ impl ProviderRegistry {
             .unwrap_or(false)
     }
 
+    /// Check whether a provider is currently at (or over) its configured
+    /// `max_concurrent` in-flight request limit. A provider with no
+    /// `max_concurrent` configured is never at capacity. Previously this
+    /// config field was parsed and stored but never read anywhere —
+    /// accepted, then silently ignored, the same class of defect the
+    /// original audits flagged for other unenforced fields
+    /// (docs/REMEDIATION_PLAN.md Phase 5.3).
+    pub fn is_at_capacity(&self, name: &str) -> bool {
+        self.state
+            .get(name)
+            .map(|s| match s.config.max_concurrent {
+                Some(limit) => s.active_requests >= limit,
+                None => false,
+            })
+            .unwrap_or(false)
+    }
+
     /// Check if a provider is registered and administratively enabled,
     /// ignoring health status.
     ///

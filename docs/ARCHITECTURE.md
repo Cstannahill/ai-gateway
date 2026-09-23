@@ -170,7 +170,8 @@ src/
 2. The background `TelemetryWriter` worker loops:
    - Buffers incoming events into in-memory vectors.
    - Flushes on timer tick (default 1000ms) or when buffer reaches capacity (default 100 items).
-   - Executes multi-row `sqlx::query` statements within a transaction.
+   - Executes the whole batch as one transaction, retrying with backoff on failure.
+   - If Postgres is still unreachable after retries, the batch is journaled to a local JSONL fallback log instead of being dropped. That log is replayed automatically — on `TelemetryWriter` startup, and again on every subsequent flush tick — so an extended outage that later recovers drains itself without operator intervention or requiring a process restart (`src/telemetry/writer.rs::replay_fallback_log`, docs/REMEDIATION_PLAN.md Phase 5.1). This is not a full write-ahead-logged outbox: an event is only journaled after an in-memory batch has already failed its DB attempts, not before every write, so a hard process crash between receiving an event and a failed flush can still lose it.
 
 ---
 

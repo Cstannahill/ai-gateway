@@ -57,7 +57,14 @@ providers:
     timeout_secs: 300
     # Enable or disable this provider without deleting configuration
     enabled: true
-    # Optional maximum concurrent active requests
+    # Optional maximum concurrent in-flight requests for this provider.
+    # Enforced at routing time: a candidate at or over this limit is
+    # filtered out with rejection reason "provider_at_capacity" (distinct
+    # from "provider_unavailable") and the router moves to the next
+    # candidate, same as an unhealthy/disabled provider — including for
+    # explicit `provider/model` addressing, which does not bypass it (it's
+    # a resource-protection constraint, not a routing preference). Unset
+    # means no limit.
     # max_concurrent: 4
 
   openrouter:

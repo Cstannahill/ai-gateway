@@ -149,6 +149,44 @@ async fn test_explicit_provider_model_routing() {
 }
 
 #[tokio::test]
+async fn test_max_concurrent_blocks_explicit_addressing_too() {
+    // `max_concurrent` is a resource-protection constraint, not a routing
+    // preference — same rationale as the `enabled` kill switch, it must
+    // not be bypassable via explicit `provider/model` addressing
+    // (docs/REMEDIATION_PLAN.md Phase 5.3).
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut config = create_provider_config("ollama", true);
+    config.max_concurrent = Some(1);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "ollama".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    provider_registry.record_request_start("ollama");
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "ollama/llama3.1:8b".to_string(),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty());
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "ollama" && r.reason == "provider_at_capacity"),
+        "expected explicit addressing to also be blocked by provider_at_capacity, got: {:?}",
+        plan.decision.rejection_reasons
+    );
+}
+
+#[tokio::test]
 async fn test_vision_filtering() {
     let mut models = HashMap::new();
     models.insert(
@@ -376,6 +414,85 @@ async fn test_disabled_provider_filtered() {
     let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
     assert_eq!(plan.candidates.len(), 1);
     assert_eq!(plan.candidates[0].provider, "enabled-p");
+}
+
+#[tokio::test]
+async fn test_max_concurrent_filtering() {
+    // `max_concurrent` was previously parsed into `ProviderConfig` and
+    // never read anywhere — accepted, then silently ignored
+    // (docs/REMEDIATION_PLAN.md Phase 5.3). A provider already at its
+    // configured ceiling must be filtered out with a distinct
+    // "provider_at_capacity" reason, and the next candidate selected.
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![
+                ModelCandidate {
+                    provider: "saturated".to_string(),
+                    model: "m1".to_string(),
+                    priority: 5,
+                    capabilities: None,
+                    max_context_length: None,
+                },
+                ModelCandidate {
+                    provider: "roomy".to_string(),
+                    model: "m2".to_string(),
+                    priority: 10,
+                    capabilities: None,
+                    max_context_length: None,
+                },
+            ],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+
+    let model_registry = ModelRegistry::new(models);
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut saturated_config = create_provider_config("saturated", true);
+    saturated_config.max_concurrent = Some(1);
+    provider_registry.register(
+        saturated_config,
+        Arc::new(MockProvider {
+            name: "saturated".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    let mut roomy_config = create_provider_config("roomy", true);
+    roomy_config.max_concurrent = Some(5);
+    provider_registry.register(
+        roomy_config,
+        Arc::new(MockProvider {
+            name: "roomy".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    // Bring "saturated" up to its configured limit; "roomy" stays well
+    // under its own.
+    provider_registry.record_request_start("saturated");
+    provider_registry.record_request_start("roomy");
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].provider, "roomy");
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "saturated" && r.reason == "provider_at_capacity"),
+        "expected saturated candidate to be rejected for provider_at_capacity, got: {:?}",
+        plan.decision.rejection_reasons
+    );
 }
 
 #[tokio::test]
