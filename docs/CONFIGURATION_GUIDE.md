@@ -92,6 +92,16 @@ providers:
     # flooded, not meant as a strict SLA-grade limiter. Unset means no
     # limit.
     # rate_limit_per_sec: 10
+    # Optional health scoring beyond the ping-based binary healthy/unhealthy:
+    # error rate (0.0-1.0) over the last 20 attempts (minimum 5 samples)
+    # above which this provider is reported as "degraded" in /health,
+    # /metrics, /providers, and the periodic ProviderSnapshot telemetry
+    # event, even though the background health-check ping still says
+    # healthy. Purely informational — never affects routing eligibility
+    # (a degraded provider is still selected the same as a healthy one) and
+    # never overrides a real ping-determined "unhealthy". Unset means
+    # reported health stays purely the ping result.
+    # degraded_error_rate_threshold: 0.5
 
   openrouter:
     name: "openrouter"

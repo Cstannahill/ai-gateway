@@ -76,6 +76,23 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_per_sec: Option<u32>,
 
+    /// Error-rate threshold (0.0-1.0) over the last 20 attempts (minimum 5
+    /// samples) above which this provider is reported as `Degraded` even
+    /// though the background ping health check still says `Healthy` — a
+    /// provider can accept connections and pass a ping while genuinely
+    /// failing real inference requests (e.g. an overloaded local server
+    /// returning 500s under load). `None` (the default) disables this
+    /// entirely: reported health is then purely the ping result, unchanged
+    /// from before this field existed. Never *upgrades* a ping-determined
+    /// `Unhealthy` — this only adds a finer-grained reason to distrust an
+    /// otherwise-`Healthy`-looking provider, never removes one. Purely
+    /// informational: it does not affect `is_available` (routing still
+    /// treats `Degraded` as available, same as before), only what
+    /// `/health`, `/metrics`, `/providers`, and the periodic
+    /// `ProviderSnapshot` telemetry event report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_error_rate_threshold: Option<f64>,
+
     /// Consecutive attempt failures (see `ProviderRegistry::record_request_end`)
     /// before the circuit opens and this provider is skipped by routing.
     /// `None` (the default) disables the breaker entirely — matches

@@ -57,6 +57,51 @@ struct ProviderRuntimeState {
     /// Fixed-window rate limiter state: the window's start time and how
     /// many attempts have been admitted since. See `is_rate_limited`.
     rate_limit_window: (Instant, u32),
+    /// Ring buffer of the last `RECENT_OUTCOMES_CAPACITY` attempt outcomes
+    /// (`true` = success), oldest first. Backs `effective_health`'s
+    /// error-rate-based `Degraded` override — see that method's doc
+    /// comment. Distinct from `total_requests`/`total_errors`, which are
+    /// cumulative since startup and would make one bad hour on a
+    /// long-running gateway invisible a week later.
+    recent_outcomes: std::collections::VecDeque<bool>,
+}
+
+/// How many recent attempt outcomes `effective_health_of` considers.
+const RECENT_OUTCOMES_CAPACITY: usize = 20;
+/// Minimum recent outcomes required before the error-rate override can fire
+/// — avoids a single failed request on a fresh or low-traffic provider
+/// reading as "degraded" from one data point.
+const RECENT_OUTCOMES_MIN_SAMPLES: usize = 5;
+
+/// The health value actually reported to `/health`, `/metrics`,
+/// `/providers`, and the periodic `ProviderSnapshot` telemetry event: the
+/// raw ping-based `health`, overridden to `Degraded` when
+/// `degraded_error_rate_threshold` is configured, at least
+/// `RECENT_OUTCOMES_MIN_SAMPLES` recent outcomes have been recorded, and
+/// their error rate meets or exceeds the threshold. Never overrides a
+/// ping-determined `Unhealthy` — see `ProviderConfig::degraded_error_rate_threshold`'s
+/// doc comment for why this only ever adds distrust, never removes it.
+/// A free function (not a method taking `&self`) so it can be called both
+/// from `ProviderRegistry::effective_health` (a single `.get()` lookup) and
+/// from `all_statuses` (already holding a `dashmap` iterator entry) without
+/// the latter re-entering the map and risking a same-shard lock conflict.
+fn effective_health_of(state: &ProviderRuntimeState) -> ProviderHealth {
+    if state.health == ProviderHealth::Unhealthy {
+        return state.health;
+    }
+    let Some(threshold) = state.config.degraded_error_rate_threshold else {
+        return state.health;
+    };
+    if state.recent_outcomes.len() < RECENT_OUTCOMES_MIN_SAMPLES {
+        return state.health;
+    }
+    let failures = state.recent_outcomes.iter().filter(|ok| !**ok).count();
+    let error_rate = failures as f64 / state.recent_outcomes.len() as f64;
+    if error_rate >= threshold {
+        ProviderHealth::Degraded
+    } else {
+        state.health
+    }
 }
 
 impl Default for ProviderRegistry {
@@ -95,6 +140,7 @@ impl ProviderRegistry {
                 circuit_state: CircuitState::Closed,
                 consecutive_failures: 0,
                 rate_limit_window: (Instant::now(), 0),
+                recent_outcomes: std::collections::VecDeque::with_capacity(RECENT_OUTCOMES_CAPACITY),
             },
         );
         self.providers.insert(name, adapter);
@@ -254,6 +300,15 @@ impl ProviderRegistry {
         }
     }
 
+    /// The health value actually reported to `/health`, `/metrics`,
+    /// `/providers`, and the periodic `ProviderSnapshot` telemetry event:
+    /// the raw ping-based `health`, overridden to `Degraded` when
+    /// `degraded_error_rate_threshold` is configured, at least
+    /// `RECENT_OUTCOMES_MIN_SAMPLES` recent outcomes have been recorded, and
+    /// their error rate meets or exceeds the threshold. Never overrides a
+    /// ping-determined `Unhealthy` — see the field's doc comment for why
+    /// this is a "never remove trust, only add distrust" signal, not a
+    /// replacement for the ping check.
     /// Record a request starting (for concurrency tracking).
     pub fn record_request_start(&self, name: &str) {
         if let Some(mut state) = self.state.get_mut(name) {
@@ -272,6 +327,12 @@ impl ProviderRegistry {
     pub fn record_request_end(&self, name: &str, is_error: bool) {
         if let Some(mut state) = self.state.get_mut(name) {
             state.active_requests = state.active_requests.saturating_sub(1);
+
+            if state.recent_outcomes.len() >= RECENT_OUTCOMES_CAPACITY {
+                state.recent_outcomes.pop_front();
+            }
+            state.recent_outcomes.push_back(!is_error);
+
             if is_error {
                 state.total_errors += 1;
                 state.consecutive_failures += 1;
@@ -334,7 +395,7 @@ impl ProviderRegistry {
                 ProviderStatus {
                     name: entry.key().clone(),
                     provider_type: s.config.r#type,
-                    health: s.health,
+                    health: effective_health_of(s),
                     enabled: s.config.enabled,
                     active_requests: s.active_requests,
                     total_requests: s.total_requests,

@@ -1,5 +1,21 @@
 # Remediation Plan
 
+## Implementation status (updated 2026-09-24, session 17 — provider health scoring beyond binary healthy/unhealthy, closing Phase 5 item 3)
+
+Closes the last open piece of item 3: "provider health scoring beyond the current binary healthy/unhealthy." The background health-check worker's ping result (`ProviderHealth::Healthy`/`Unhealthy`/`Unknown`) says nothing about whether a provider is actually succeeding on *real* inference traffic — a local server can accept a `/models` ping fine while genuinely failing every real request under load.
+
+**New opt-in `ProviderConfig.degraded_error_rate_threshold: Option<f64>`** (0.0-1.0, `None` disables it — same shape as every other Phase 5 resource-protection field). `ProviderRuntimeState` gained a `recent_outcomes: VecDeque<bool>` ring buffer (last 20 attempts, oldest evicted first), pushed to on every `record_request_end` call — deliberately separate from the existing cumulative `total_requests`/`total_errors` counters, which never reset and would make one bad hour on a long-running gateway invisible a week later.
+
+**New `effective_health_of` (free function, not a method — called both from a single `.get()` lookup and from inside `all_statuses`'s `dashmap` iterator, where re-entering the map via `self.` could risk a same-shard lock conflict)**: returns the raw ping-based health unchanged unless `degraded_error_rate_threshold` is configured, at least 5 recent outcomes exist, and their error rate meets or exceeds the threshold — in which case it reports `Degraded` instead. Never overrides a real ping-determined `Unhealthy`: this is a "only ever add distrust, never remove it" signal. **Deliberately informational only** — `is_available` (the actual routing gate) still reads the raw `state.health` field directly, untouched by this; a degraded provider is still selected exactly like a healthy one. Wired into `all_statuses()`, so `/health`, `/metrics`, `/providers`, and the periodic `ProviderSnapshot` telemetry event all pick it up automatically with no changes needed at those call sites.
+
+Tests (`tests/routing_tests.rs`, no DB): `test_degraded_error_rate_threshold_reports_degraded_after_enough_recent_failures` (too few samples → no override; enough samples over threshold → `Degraded`, and confirms `is_available` still returns `true`), `test_degraded_error_rate_threshold_never_overrides_a_real_unhealthy_ping`, `test_degraded_error_rate_threshold_disabled_by_default`.
+
+`cargo test --all-targets --offline` is green: **105 passed, 0 ignored, 0 warnings** (up from 102 — 3 new tests). No migration needed.
+
+`docs/CONFIGURATION_GUIDE.md` and `docs/ARCHITECTURE.md` updated.
+
+**Item 3 (circuit breakers, provider health scoring, rate limiting, `max_concurrent` enforcement) is now fully closed.** Remaining Phase 5 scope: OTLP export (item 2), prompt/semantic caching (item 4), and the dataset/annotation workflows (item 6 — blocked on Phase 4.3's Python layer, out of scope here). Item 7 (learned/AI-driven routing) remains permanently excluded.
+
 ## Implementation status (updated 2026-09-24, session 16 — per-provider rate limiting, Phase 5 item 3)
 
 Adds the last piece of item 3 not yet covered by `max_concurrent` (Phase 5.3) or the circuit breaker (session 14): a requests-per-second limiter, distinct from both — it bounds *arrival rate*, not simultaneous in-flight requests or consecutive-failure history.

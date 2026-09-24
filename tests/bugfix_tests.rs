@@ -88,6 +88,7 @@ fn test_endpoint_normalization() {
             timeout_secs: 30,
             max_concurrent: None,
                 rate_limit_per_sec: None,
+                degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
             enabled: true,

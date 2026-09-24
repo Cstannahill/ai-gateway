@@ -61,6 +61,7 @@ fn create_provider_config(name: &str, enabled: bool) -> ProviderConfig {
         timeout_secs: 30,
         max_concurrent: None,
                 rate_limit_per_sec: None,
+                degraded_error_rate_threshold: None,
         circuit_breaker_threshold: None,
         circuit_breaker_cooldown_secs: 30,
         enabled,
@@ -1314,4 +1315,107 @@ async fn test_rate_limit_disabled_by_default() {
         let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
         assert_eq!(plan.candidates.len(), 1, "rate limiter must stay disabled with no rate_limit_per_sec configured");
     }
+}
+
+#[tokio::test]
+async fn test_degraded_error_rate_threshold_reports_degraded_after_enough_recent_failures() {
+    // A provider can accept connections and pass a ping while genuinely
+    // failing real inference requests — `degraded_error_rate_threshold`
+    // surfaces that as `Degraded` in reported status even though the ping
+    // still says `Healthy` (docs/REMEDIATION_PLAN.md Phase 5 health-scoring
+    // work). Purely informational: it must not affect routing eligibility.
+    let mut provider_registry = ProviderRegistry::new();
+    let mut config = create_provider_config("flaky", true);
+    config.degraded_error_rate_threshold = Some(0.5);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "flaky".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    provider_registry.update_health("flaky", ProviderHealth::Healthy);
+
+    // Fewer than RECENT_OUTCOMES_MIN_SAMPLES (5) failures: no override yet.
+    for _ in 0..3 {
+        provider_registry.record_request_start("flaky");
+        provider_registry.record_request_end("flaky", true);
+    }
+    let status = provider_registry
+        .all_statuses()
+        .into_iter()
+        .find(|s| s.name == "flaky")
+        .unwrap();
+    assert_eq!(status.health, ProviderHealth::Healthy, "too few samples yet, must not report Degraded");
+
+    // Two more failures brings it to 5 samples, 100% error rate — well over
+    // the 0.5 threshold.
+    for _ in 0..2 {
+        provider_registry.record_request_start("flaky");
+        provider_registry.record_request_end("flaky", true);
+    }
+    let status = provider_registry
+        .all_statuses()
+        .into_iter()
+        .find(|s| s.name == "flaky")
+        .unwrap();
+    assert_eq!(status.health, ProviderHealth::Degraded);
+    assert!(
+        provider_registry.is_available("flaky"),
+        "Degraded must remain available for routing — this is informational only"
+    );
+}
+
+#[tokio::test]
+async fn test_degraded_error_rate_threshold_never_overrides_a_real_unhealthy_ping() {
+    let mut provider_registry = ProviderRegistry::new();
+    let mut config = create_provider_config("down", true);
+    config.degraded_error_rate_threshold = Some(0.5);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "down".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    provider_registry.update_health("down", ProviderHealth::Unhealthy);
+
+    let status = provider_registry
+        .all_statuses()
+        .into_iter()
+        .find(|s| s.name == "down")
+        .unwrap();
+    assert_eq!(
+        status.health,
+        ProviderHealth::Unhealthy,
+        "a real ping-determined Unhealthy must never be reported as merely Degraded"
+    );
+}
+
+#[tokio::test]
+async fn test_degraded_error_rate_threshold_disabled_by_default() {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        create_provider_config("flaky", true),
+        Arc::new(MockProvider {
+            name: "flaky".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    provider_registry.update_health("flaky", ProviderHealth::Healthy);
+
+    for _ in 0..20 {
+        provider_registry.record_request_start("flaky");
+        provider_registry.record_request_end("flaky", true);
+    }
+    let status = provider_registry
+        .all_statuses()
+        .into_iter()
+        .find(|s| s.name == "flaky")
+        .unwrap();
+    assert_eq!(
+        status.health,
+        ProviderHealth::Healthy,
+        "with no degraded_error_rate_threshold configured, reported health must stay purely ping-based"
+    );
 }
