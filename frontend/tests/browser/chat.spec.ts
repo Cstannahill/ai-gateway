@@ -123,7 +123,15 @@ test("live chat sends settings and completed history, renders safe markdown, and
   expect(
     await page.locator(".chat-markdown img, .chat-markdown script").count(),
   ).toBe(0);
-  await expect(page.getByText("10 input · 20 output tokens*")).toBeVisible();
+  await expect(page.locator(".response-price")).toContainText("30 tok");
+  await page
+    .getByRole("button", { name: "More message actions" })
+    .last()
+    .click();
+  await expect(
+    page.getByRole("dialog").getByText("10 input · 20 output tokens*"),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Close dialog" }).click();
   expect(payloads[0]).toMatchObject({
     model: "coding-fast",
     max_completion_tokens: 50000,
@@ -235,4 +243,218 @@ test("mobile chat has accessible settings, history, and no horizontal overflow",
     path: "verification/chat-mobile-light.png",
     fullPage: true,
   });
+});
+
+test("side by side demo streams independent responses, opens reasoning and safe details, and switches room controls", async ({
+  page,
+}) => {
+  await page.goto("/?view=chat&demo=1");
+  for (const model of ["coding-fast", "reasoning"]) {
+    await page
+      .getByRole("button", {
+        name: model === "coding-fast" ? "Choose a model" : "Add model",
+      })
+      .click();
+    await page
+      .getByRole("textbox", { name: "Model ID or gateway alias" })
+      .fill(model);
+    await page.getByRole("button", { name: "Use model", exact: true }).click();
+  }
+  await expect(page.locator(".chat-model-chip")).toHaveCount(2);
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("Compare these designs");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(
+    page.getByRole("article", { name: "Assistant response" }),
+  ).toHaveCount(2);
+  await expect(
+    page.getByRole("button", { name: "Regenerate in new chat" }),
+  ).toHaveCount(2);
+  await expect(page.locator(".response-price")).toHaveCount(2);
+  await expect(page.locator(".response-price").first()).toContainText("demo");
+  await expect(page.locator(".chat-answer-grid.multiple")).toHaveCSS(
+    "display",
+    "grid",
+  );
+  await page.locator(".reasoning-toggle").first().click();
+  await expect(
+    page.getByRole("complementary", { name: "Reasoning sidebar" }),
+  ).toContainText("No other model");
+  await page.getByRole("button", { name: "Close reasoning sidebar" }).click();
+  await page.locator(".chat-markdown details summary").first().click();
+  await expect(page.locator(".chat-markdown details").first()).toHaveAttribute(
+    "open",
+    "",
+  );
+  await page.locator(".chat-room-menu > summary").click();
+  await page.getByRole("switch", { name: "Show metrics inline" }).uncheck();
+  await expect(page.locator(".response-price")).toHaveCount(0);
+  await page.getByRole("button", { name: "Use purple message color" }).click();
+  await expect(page.locator(".chat-workspace")).toHaveAttribute(
+    "data-message-color",
+    "purple",
+  );
+  await page.getByRole("switch", { name: "Show metrics inline" }).check();
+  await page.locator(".chat-room-menu > summary").click();
+  await page
+    .getByRole("combobox", { name: "Response layout" })
+    .selectOption("list");
+  await expect(page.locator(".chat-turns")).toHaveClass(/layout-list/);
+  await page
+    .getByRole("combobox", { name: "Response layout" })
+    .selectOption("columns");
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.locator(".chat-transcript").evaluate((el) => {
+    el.scrollTop = 0;
+  });
+  await page.screenshot({
+    path: "verification/chat-multimodel.png",
+    fullPage: true,
+  });
+});
+
+test("parallel live requests keep separate model context on the next turn", async ({
+  page,
+}) => {
+  await page.route("**/api/gateway/**", (route) => {
+    const u = new URL(route.request().url());
+    return route.fulfill({
+      json: demoResponse(u.pathname.replace("/api/gateway", "") + u.search),
+    });
+  });
+  const payloads: Record<string, unknown>[] = [];
+  await page.route("**/api/chat", (route) => {
+    const payload = route.request().postDataJSON();
+    payloads.push(payload);
+    const model = payload.model as string;
+    const frame = (value: unknown) =>
+      `data: ${JSON.stringify({ id: "chatcmpl-0199768a-6e00-7000-8000-000000000001", model, choices: [value] })}\n\n`;
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body:
+        frame({
+          index: 0,
+          delta: { content: `Answer from ${model}` },
+          finish_reason: null,
+        }) +
+        frame({ index: 0, delta: {}, finish_reason: "stop" }) +
+        "data: [DONE]\n\n",
+    });
+  });
+  await page.goto("/?view=chat");
+  for (const model of ["model-a", "model-b"]) {
+    await page
+      .getByRole("button", {
+        name: model === "model-a" ? "Choose a model" : "Add model",
+      })
+      .click();
+    await page
+      .getByRole("textbox", { name: "Model ID or gateway alias" })
+      .fill(model);
+    await page.getByRole("button", { name: "Use model", exact: true }).click();
+  }
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("First turn");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(
+    page.getByRole("article", { name: "Assistant response" }),
+  ).toHaveCount(2);
+  await expect(
+    page.getByRole("button", { name: "Regenerate in new chat" }),
+  ).toHaveCount(2);
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("Second turn");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(
+    page.getByRole("article", { name: "Assistant response" }),
+  ).toHaveCount(4);
+  await expect(
+    page.getByRole("button", { name: "Regenerate in new chat" }),
+  ).toHaveCount(4);
+  expect(payloads).toHaveLength(4);
+  for (const model of ["model-a", "model-b"]) {
+    const second = payloads.filter((p) => p.model === model)[1];
+    expect(
+      (second.messages as { content: string }[]).map((m) => m.content),
+    ).toEqual(["First turn", `Answer from ${model}`, "Second turn"]);
+  }
+  await expect(page.locator(".response-price").first()).toContainText("— cost");
+});
+
+test("room export, validated import, character preview and undo work without inference", async ({
+  page,
+}) => {
+  let inference = 0;
+  page.on("request", (r) => {
+    if (r.url().endsWith("/api/chat")) inference++;
+  });
+  await page.goto("/?view=chat&demo=1");
+  await page.getByRole("button", { name: "Choose a model" }).click();
+  await page
+    .getByRole("textbox", { name: "Model ID or gateway alias" })
+    .fill("coding-fast");
+  await page.getByRole("button", { name: "Use model", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "Message", exact: true })
+    .fill("Save this conversation");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(
+    page.getByRole("button", { name: "Regenerate in new chat" }),
+  ).toBeVisible();
+  await page.locator(".chat-room-menu > summary").click();
+  const download = page.waitForEvent("download");
+  await page
+    .getByRole("button", { name: "Export conversation", exact: true })
+    .last()
+    .click();
+  const file = await download;
+  const path = await file.path();
+  expect(path).toBeTruthy();
+  const { readFile } = await import("node:fs/promises");
+  const content = await readFile(path!);
+  await page
+    .locator('input[aria-label="Import chat JSON"]')
+    .setInputFiles({
+      name: "chat.json",
+      mimeType: "application/json",
+      buffer: content,
+    });
+  await expect(page.locator(".chat-conversations > div")).toHaveCount(2);
+  await expect(
+    page.getByText("Conversation imported into this mode."),
+  ).toBeVisible();
+  await page
+    .locator('input[aria-label="Import character JSON"]')
+    .setInputFiles({
+      name: "character.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(
+        JSON.stringify({
+          data: { name: "Careful reviewer", system_prompt: "Be precise." },
+        }),
+      ),
+    });
+  await expect(
+    page.getByRole("dialog", { name: /Import character/ }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Apply character" }).click();
+  await page.getByRole("button", { name: "Generation settings" }).click();
+  await expect(page.locator(".chat-settings textarea")).toHaveValue(
+    /Be precise/,
+  );
+  await page.getByRole("button", { name: "Close dialog" }).click();
+  await page.locator(".chat-room-menu > summary").click();
+  await page.getByRole("button", { name: "Clear chat" }).click();
+  await expect(
+    page.getByRole("heading", { name: "What are we working on?" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Undo last removal" }).click();
+  await expect(
+    page.getByRole("article", { name: "Assistant response" }),
+  ).toBeVisible();
+  expect(inference).toBe(0);
 });
