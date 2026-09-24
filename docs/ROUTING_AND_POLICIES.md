@@ -209,3 +209,17 @@ If all candidates fail, the gateway logs `RequestCompleted { success: false }` t
 }
 ```
 HTTP status: `502 Bad Gateway`.
+
+## Response Caching
+
+An opt-in (`caching.enabled`, default `false`), in-memory, exact-match cache sitting *before* routing entirely — a cache hit skips model resolution, candidate filtering, policy application, and provider dispatch in one step (`src/cache/mod.rs`, `ResponseCache`).
+
+**Scoped to non-streaming chat completions only.** A request with `stream: true` is never checked against the cache and never populates it, and a cache hit is never served as a synthetic stream. This is a deliberate v1 scope decision, not an oversight: replaying a cached completion as SSE would need the same "synthetic event reconstruction" machinery `InstrumentedStream` already uses for a non-streaming provider response (see its `synthetic` field), and building that out is left for a later pass if the non-streaming case proves valuable enough to justify it.
+
+**Cache key**: the entire serialized request minus `request_id`, `received_at`, and `stream` (normalized to `false`) — see `cache_key_for`'s doc comment for why this is a "serialize everything, then subtract the known non-semantic fields" strategy rather than a hand-maintained allowlist of fields to include (an allowlist silently goes stale every time a new request field is added, the exact class of bug several of this project's audits have flagged elsewhere). Two requests differing only in `stream` share a cache entry; anything else differing (model, messages, temperature, tools, routing hints, `metadata`, ...) is a different key.
+
+**What this means in practice**: caching is exact-match, not semantic — a byte-for-byte-different-but-meaning-the-same-thing request (different whitespace, a rephrased question) is a cache miss. There is no embedding-similarity layer; adding one is exactly the "semantic caching" v2 item this plan's Phase 5 originally deferred, and remains deferred here.
+
+**TTL and eviction**: `caching.ttl_secs` (default 300) bounds staleness; `caching.max_entries` (default 1000) bounds memory, evicting the oldest-*inserted* entry (not oldest-*accessed* — a full LRU wasn't judged worth the added complexity for a personal single-process gateway) once exceeded. The cache lives only in process memory — never persisted, never shared across instances, lost on restart. This is a performance optimization, not data of record; nothing about telemetry/analytics correctness depends on it.
+
+**Telemetry on a hit**: still emits `RequestReceived` (so every incoming request is recorded) and `RequestCompleted` with `success: true`, `total_attempts: 0`, and `serving_provider`/`resolved_model` copied from whichever real dispatch originally populated the cache entry — an honest record of "served from cache," not a fabricated "no provider involved." `total_attempts: 0` combined with `success: true` is otherwise unreachable (the only other zero-attempts case, a routing failure with no viable candidates, is always `success: false`), so this combination doubles as an analyzable cache-hit marker without a schema change. The HTTP response itself also carries an `x-cache: HIT` header.

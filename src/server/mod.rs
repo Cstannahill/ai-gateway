@@ -47,6 +47,12 @@ pub struct AppState {
     /// (docs/frontend/API_GAPS.md item 8, persistence-health half only —
     /// auth is out of scope for this personal, loopback-only deployment).
     pub telemetry_health: Arc<TelemetryHealth>,
+    /// Exact-match response cache for non-streaming chat completions.
+    /// `None` when `caching.enabled` is false (the default) — every cache
+    /// check/write site treats `None` as an unconditional miss/no-op, so
+    /// disabling caching costs nothing at the call sites, not just at
+    /// startup (docs/REMEDIATION_PLAN.md Phase 5 caching work).
+    pub response_cache: Option<Arc<crate::cache::ResponseCache>>,
 }
 
 impl AppState {

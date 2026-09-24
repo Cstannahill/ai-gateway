@@ -137,6 +137,7 @@ async fn seeded_state_and_request_id() -> Option<(Arc<AppState>, Uuid)> {
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -166,6 +167,7 @@ async fn analytics_returns_503_without_a_database() {
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: None,
     });
 
@@ -296,6 +298,7 @@ async fn analytics_fallback_analysis_reflects_a_failed_then_succeeded_request() 
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -456,6 +459,7 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -609,6 +613,7 @@ async fn analytics_cost_summary_distinguishes_priced_from_unpriced_attempts() {
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -778,6 +783,7 @@ async fn analytics_summary_covers_boundaries_retries_pending_and_usage_dedup() {
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -850,6 +856,7 @@ async fn analytics_summary_rejects_invalid_bucket_and_oversized_range() {
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -940,6 +947,7 @@ async fn analytics_requests_keyset_pagination_is_stable_under_concurrent_inserts
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool.clone()),
     });
 
@@ -1077,6 +1085,7 @@ async fn analytics_requests_supports_attempted_provider_application_task_and_tag
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -1249,6 +1258,7 @@ async fn analytics_request_detail_includes_attempt_spans_routing_errors_and_cost
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -1340,6 +1350,7 @@ async fn analytics_timeline_cursor_pagination_returns_each_event_exactly_once() 
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -1455,6 +1466,7 @@ async fn analytics_request_detail_exposes_stable_id_and_choice_index_per_generat
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 
@@ -1563,6 +1575,7 @@ async fn analytics_usage_canonical_flags_single_duplicate_and_conflicting_observ
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
         analytics_pool: Some(pool),
     });
 

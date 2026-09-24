@@ -143,6 +143,7 @@ src/
 4. `PropagateRequestIdLayer` ensures `x-request-id` header is attached to client response.
 5. Inbound JSON is deserialized into protocol structures and mapped to [`GatewayRequest`](file:///s:/Code/RustProjects/AI-Gateway/src/types/request.rs#L12).
 6. Gateway records `TelemetryEvent::RequestReceived`.
+7. For a non-streaming request, if `caching.enabled` and an exact-match entry exists in `AppState.response_cache` (`ResponseCache`, `src/cache/mod.rs`), the cached body is returned immediately here — skipping every remaining step through provider dispatch — with an `x-cache: HIT` response header. See `docs/ROUTING_AND_POLICIES.md`'s caching section for the cache key, TTL/eviction, and why this is scoped to non-streaming requests only.
 
 ### Step 2: Model Resolution & Candidate Generation
 1. Router queries [`ModelRegistry::resolve`](file:///s:/Code/RustProjects/AI-Gateway/src/registry/model_registry.rs#L32).

@@ -239,6 +239,25 @@ routing:
     - "content_filter"  # 451 upstream safety / moderation block
 
 
+# ─── 4a. Response Caching ─────────────────────────────────────────────────────
+# Exact-match caching for non-streaming chat completions only (a streaming
+# request is never cached and never served from cache — see
+# docs/ROUTING_AND_POLICIES.md's caching section for why). Disabled by
+# default. This is an in-memory, per-process cache: it is never persisted
+# and is lost on restart, and does not survive across a multi-instance
+# deployment (not a concern for this gateway's personal, single-process
+# scope).
+caching:
+  enabled: false
+  # How long a cached response stays valid.
+  ttl_secs: 300
+  # Maximum distinct cached entries before the oldest-inserted one is
+  # evicted to make room (oldest-inserted, not oldest-accessed — see
+  # ResponseCache's doc comment in src/cache/mod.rs for why a full LRU
+  # wasn't worth the complexity here).
+  max_entries: 1000
+
+
 # ─── 5. Observability & PostgreSQL Telemetry ─────────────────────────────────
 telemetry:
   # Global toggle for telemetry recording

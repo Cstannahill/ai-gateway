@@ -35,6 +35,9 @@ Generates chat completions from a logical model alias or explicit provider deplo
 - `Authorization: Bearer <token>` *(Optional if gateway authentication is disabled)*
 - `x-request-id: <uuid>` *(Optional: client-provided request ID for tracing)*
 
+### Response Headers
+- `x-cache: HIT` *(present only when `caching.enabled` is true and this exact non-streaming request matched a live cache entry — see `docs/ROUTING_AND_POLICIES.md`'s caching section. Absent entirely on a miss or when caching is disabled — never sent as `x-cache: MISS`.)*
+
 ### Request Parameters
 
 ```json

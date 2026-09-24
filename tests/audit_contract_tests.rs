@@ -177,6 +177,7 @@ fn setup(
             start_time: Instant::now(),
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
             analytics_pool: None,
         }),
         rx,
@@ -229,6 +230,7 @@ fn setup_embeddings(
             start_time: Instant::now(),
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
             analytics_pool: None,
         }),
         rx,
@@ -625,4 +627,83 @@ async fn database_batch_must_preserve_chunks_for_new_requests() {
         chunks, 10,
         "Parent records persist, but chunks in the same batch are lost"
     );
+}
+
+#[tokio::test]
+async fn response_cache_serves_a_repeated_non_streaming_request_without_a_second_dispatch() {
+    // Exact-match caching (docs/REMEDIATION_PLAN.md Phase 5 caching work):
+    // an identical non-streaming request within TTL must be served from
+    // cache — the provider's `execute` must not be invoked a second time —
+    // and the response must carry the x-cache: HIT header.
+    let mut config: GatewayConfig = serde_yaml::from_str("{}").unwrap();
+    config.routing.max_retries_per_provider = 1;
+    config.routing.fallback_on.clear();
+    let seen = Arc::new(Mutex::new(vec![]));
+    let mut providers = ProviderRegistry::new();
+    providers.register(
+        pc("first", true),
+        Arc::new(ProbeProvider {
+            name: "first".into(),
+            mode: 0,
+            caps: ModelCapabilities::default(),
+            seen: seen.clone(),
+        }),
+    );
+    let models = serde_json::from_value(
+        json!({"alias": {"name":"alias","candidates":[{"provider":"first","model":"m","priority":1}]}}),
+    )
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = Arc::new(AppState {
+        config,
+        model_registry: ModelRegistry::new(models),
+        provider_registry: providers,
+        router: RoutingEngine::new("ordered".into()),
+        telemetry_tx: tx,
+        start_time: Instant::now(),
+        total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(
+            ai_gateway::telemetry::TelemetryMode::Disabled,
+        )),
+        response_cache: Some(Arc::new(ai_gateway::cache::ResponseCache::new(
+            std::time::Duration::from_secs(60),
+            100,
+        ))),
+        analytics_pool: None,
+    });
+
+    let body = json!({"model":"alias","messages":[{"role":"user","content":"hello"}],"stream":false});
+
+    let (status1, _body1) = post(state.clone(), "/v1/chat/completions", body.clone()).await;
+    assert_eq!(status1, 200);
+    assert_eq!(seen.lock().unwrap().len(), 1, "first request must dispatch to the provider");
+
+    let response = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+        Some("HIT"),
+        "second identical request must be served from cache"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "a cache hit must not dispatch to the provider a second time"
+    );
+
+    // A request with different content must miss and dispatch normally.
+    let different_body = json!({"model":"alias","messages":[{"role":"user","content":"different"}],"stream":false});
+    let (status3, _body3) = post(state.clone(), "/v1/chat/completions", different_body).await;
+    assert_eq!(status3, 200);
+    assert_eq!(seen.lock().unwrap().len(), 2, "a different request must not hit the first request's cache entry");
 }

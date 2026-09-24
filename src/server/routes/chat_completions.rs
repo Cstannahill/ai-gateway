@@ -124,6 +124,33 @@ pub async fn handle(
         uses_reasoning: request.reasoning.as_ref().is_some_and(|r| r.enabled),
     });
 
+    // ─── Cache check (non-streaming only — see src/cache/mod.rs) ─────────
+    // A hit skips routing/dispatch entirely. `total_attempts: 0` combined
+    // with `success: true` is the deliberate, documented marker for "served
+    // from cache" in `RequestCompleted` — that combination is otherwise
+    // unreachable (the only other `total_attempts: 0` case is the
+    // zero-candidates routing failure, which is always `success: false`),
+    // so analytics can distinguish a cache hit from a real dispatch without
+    // a schema change.
+    if !request.stream
+        && let Some(cache) = &state.response_cache
+        && let Some(key) = crate::cache::cache_key_for(&request)
+        && let Some(cached) = cache.get(&key)
+    {
+        state.emit_telemetry(TelemetryEvent::RequestCompleted {
+            request_id,
+            timestamp: Utc::now(),
+            total_latency_us: (Utc::now() - received_at).num_microseconds().unwrap_or(0) as u64,
+            total_attempts: 0,
+            serving_provider: Some(cached.provider.clone()),
+            resolved_model: Some(cached.model.clone()),
+            success: true,
+        });
+        let mut response = Json(cached.body).into_response();
+        response.headers_mut().insert("x-cache", "HIT".parse().unwrap());
+        return response;
+    }
+
     // ─── Route the request ───────────────────────────────────────────────
     let routing_plan = match state.router.route(
         &request,
@@ -475,6 +502,19 @@ pub async fn handle(
                             "choices": choices_json,
                             "usage": usage,
                         });
+
+                        if let Some(cache) = &state.response_cache
+                            && let Some(key) = crate::cache::cache_key_for(&request)
+                        {
+                            cache.insert(
+                                key,
+                                crate::cache::CachedResponse {
+                                    body: response.clone(),
+                                    provider: candidate.provider.clone(),
+                                    model: candidate.model.clone(),
+                                },
+                            );
+                        }
 
                         // Emit RequestCompleted.
                         state.emit_telemetry(TelemetryEvent::RequestCompleted {

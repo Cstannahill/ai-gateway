@@ -40,6 +40,12 @@ pub struct GatewayConfig {
     /// Audit A15/A17).
     #[serde(default)]
     pub pricing: HashMap<String, PricingEntry>,
+
+    /// Exact-match response caching for non-streaming chat completions.
+    /// Disabled by default — an opt-in feature (Phase 5 caching work), not
+    /// a change to existing behavior.
+    #[serde(default)]
+    pub caching: CachingConfig,
 }
 
 /// Cost per 1,000 tokens for one provider/model deployment, in USD.
@@ -47,6 +53,42 @@ pub struct GatewayConfig {
 pub struct PricingEntry {
     pub input_cost_per_1k: f64,
     pub output_cost_per_1k: f64,
+}
+
+/// Response cache configuration. See `src/cache/mod.rs` and
+/// `docs/ROUTING_AND_POLICIES.md`'s caching section for exactly what this
+/// caches and why it's scoped to non-streaming requests only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// How long a cached response stays valid.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Maximum distinct cached entries before the oldest-inserted one is
+    /// evicted to make room.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for CachingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: default_cache_ttl_secs(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_cache_max_entries() -> usize {
+    1000
 }
 
 /// Server bind / runtime configuration.
@@ -351,6 +393,7 @@ impl GatewayConfig {
             routing: RoutingConfig::default(),
             telemetry: TelemetryConfig::default(),
             pricing: HashMap::new(),
+            caching: CachingConfig::default(),
         }
     }
 

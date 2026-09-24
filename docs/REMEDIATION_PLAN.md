@@ -1,5 +1,25 @@
 # Remediation Plan
 
+## Implementation status (updated 2026-09-24, session 18 — exact-match response caching, Phase 5 item 4 (partial))
+
+Implements the exact-match half of item 4 ("prompt/semantic caching"). Semantic caching (embedding-similarity matching for near-duplicate prompts) remains explicitly out of scope for this pass — it needs an embedding model call per request plus a similarity-threshold judgment call, a materially different and larger piece of work; see `docs/ROUTING_AND_POLICIES.md`'s new caching section for the honest scope statement.
+
+**New `src/cache/mod.rs`**: `ResponseCache`, an in-memory, per-process cache (never persisted, lost on restart — a performance optimization, not data of record). Fixed 1-window-per-entry TTL plus oldest-inserted-first eviction once `max_entries` is exceeded (not a full LRU — not worth the complexity for a personal single-process gateway). `cache_key_for` builds the key by serializing the *entire* request and subtracting `request_id`/`received_at`/normalizing `stream` to `false`, rather than a hand-maintained allowlist of fields to include — an allowlist silently drifts stale every time a new request field is added, the exact class of defect several of this project's earlier audits flagged elsewhere.
+
+**New opt-in `GatewayConfig.caching`** (`enabled: false` by default, `ttl_secs: 300`, `max_entries: 1000`) and `AppState.response_cache: Option<Arc<ResponseCache>>` — `None` when disabled, so every call site treats "disabled" as an unconditional no-op rather than checking a separate flag.
+
+**Scoped to non-streaming chat completions only.** A `stream: true` request is never checked against the cache and never populates it — replaying a cached completion as a synthetic SSE stream would need the same reconstruction machinery `InstrumentedStream` already uses for a non-streaming provider response (its `synthetic` field), and that's left for later if this proves valuable enough to justify. Wired into `src/server/routes/chat_completions.rs`: a cache check right after `RequestReceived` is emitted (so every incoming request is still recorded) and before routing — a hit skips model resolution, candidate filtering, and provider dispatch entirely; a write happens at the same point the non-streaming JSON response is normally constructed.
+
+**Telemetry on a hit** is honest, not fabricated: still emits `RequestCompleted` with `success: true` and `serving_provider`/`resolved_model` copied from whichever real dispatch originally populated the entry, but `total_attempts: 0` — a combination otherwise unreachable (the only other zero-attempts case, no viable routing candidates, is always `success: false`) and so doubles as an analyzable "served from cache" marker without a schema/migration change. The HTTP response also carries `x-cache: HIT`.
+
+Tests: 5 unit tests in `src/cache/mod.rs` (`get`/`insert`/TTL expiry/eviction/`cache_key_for`'s field-inclusion and `stream`-exclusion behavior) plus one full-stack integration test, `tests/audit_contract_tests.rs::response_cache_serves_a_repeated_non_streaming_request_without_a_second_dispatch`, which drives the real `chat_completions::handle` via `build_router`+`oneshot` twice with an identical body and asserts the `ProbeProvider`'s `execute` was invoked exactly once (not twice), the second response carries `x-cache: HIT`, and a third, differently-worded request correctly misses and dispatches again.
+
+`cargo test --all-targets --offline` is green: **111 passed, 0 ignored, 0 warnings** (up from 105 — 6 new tests). No migration needed.
+
+`docs/CONFIGURATION_GUIDE.md` (new `caching:` section), `docs/ROUTING_AND_POLICIES.md` (new "Response Caching" section), `docs/API_REFERENCE.md` (`x-cache` response header), and `docs/ARCHITECTURE.md` (Step 1 addition) all updated.
+
+**Remaining Phase 5 scope**: OTLP export (item 2), semantic caching (the other half of item 4), and the dataset/annotation workflows (item 6 — blocked on Phase 4.3's Python layer, out of scope here). Item 7 (learned/AI-driven routing) remains permanently excluded.
+
 ## Implementation status (updated 2026-09-24, session 17 — provider health scoring beyond binary healthy/unhealthy, closing Phase 5 item 3)
 
 Closes the last open piece of item 3: "provider health scoring beyond the current binary healthy/unhealthy." The background health-check worker's ping result (`ProviderHealth::Healthy`/`Unhealthy`/`Unknown`) says nothing about whether a provider is actually succeeding on *real* inference traffic — a local server can accept a `/models` ping fine while genuinely failing every real request under load.

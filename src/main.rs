@@ -143,6 +143,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ─── Build application state ─────────────────────────────────────────
+    let response_cache = config.caching.enabled.then(|| {
+        tracing::info!(
+            ttl_secs = config.caching.ttl_secs,
+            max_entries = config.caching.max_entries,
+            "Response caching enabled (non-streaming requests only)"
+        );
+        Arc::new(ai_gateway::cache::ResponseCache::new(
+            std::time::Duration::from_secs(config.caching.ttl_secs),
+            config.caching.max_entries,
+        ))
+    });
+
     let state = Arc::new(AppState {
         config: config.clone(),
         model_registry,
@@ -153,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         analytics_pool,
         telemetry_health: telemetry.health(),
+        response_cache,
     });
 
     // ─── Snapshot configured models once at startup ───────────────────────
