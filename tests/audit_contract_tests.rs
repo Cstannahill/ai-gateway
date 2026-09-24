@@ -108,7 +108,7 @@ impl Provider for ProbeProvider {
                 delta: "partial output".into(),
             },
         ];
-        if self.mode == 3 {
+        if self.mode == 3 || self.mode == 4 {
             // Simulates an `n > 1` response: a second choice's content
             // delta at index 1, both wrapped up by one Completed event
             // (docs/REMEDIATION_PLAN.md Phase 2.3 / Audit A08).
@@ -118,7 +118,11 @@ impl Provider for ProbeProvider {
                 delta: "second choice output".into(),
             });
         }
-        if self.mode == 2 {
+        if self.mode == 2 || self.mode == 4 {
+            // Mode 4: an `n > 1` stream that fails mid-stream — both
+            // choices' partial content must be preserved, each with its
+            // own GenerationContent event marked `status: "partial"`
+            // (docs/frontend/API_GAPS.md item 5).
             events.push(error);
         } else {
             events.push(ProviderEvent::Completed {
@@ -172,6 +176,7 @@ fn setup(
             telemetry_tx: tx,
             start_time: Instant::now(),
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+            telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
             analytics_pool: None,
         }),
         rx,
@@ -223,6 +228,7 @@ fn setup_embeddings(
             telemetry_tx: tx,
             start_time: Instant::now(),
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+            telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
             analytics_pool: None,
         }),
         rx,
@@ -353,6 +359,72 @@ async fn chat_completions_must_return_all_choices_for_n_greater_than_one() {
     assert_eq!(choices[0]["message"]["content"], "partial output");
     assert_eq!(choices[1]["index"], 1);
     assert_eq!(choices[1]["message"]["content"], "second choice output");
+}
+#[tokio::test]
+async fn telemetry_emits_separate_generation_content_per_choice_for_n_greater_than_one() {
+    // docs/frontend/API_GAPS.md item 5's choice-ID gap: telemetry must
+    // persist one GenerationContent event per choice, not one event
+    // merging every choice of an `n > 1` attempt together.
+    let (state, mut rx, _) = setup(3, true);
+    let (status, _) = post(
+        state,
+        "/v1/chat/completions",
+        json!({"model":"alias","messages":[{"role":"user","content":"hi"}],"n":2}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let events = drain(&mut rx);
+    let mut generations: Vec<(u32, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            TelemetryEvent::GenerationContent { choice_index, content, status, .. } => {
+                Some((*choice_index, content.clone(), status.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    generations.sort_by_key(|(idx, ..)| *idx);
+
+    assert_eq!(
+        generations,
+        vec![
+            (0, "partial output".to_string(), "complete".to_string()),
+            (1, "second choice output".to_string(), "complete".to_string()),
+        ]
+    );
+}
+#[tokio::test]
+async fn telemetry_preserves_partial_content_per_choice_on_mid_stream_error() {
+    // The same choice-separation must hold on the partial-content-on-error
+    // path (Audit A04), not just the clean-completion path.
+    let (state, mut rx, _) = setup(4, true);
+    post(
+        state,
+        "/v1/chat/completions",
+        json!({"model":"alias","messages":[{"role":"user","content":"hi"}],"n":2}),
+    )
+    .await;
+
+    let events = drain(&mut rx);
+    let mut generations: Vec<(u32, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            TelemetryEvent::GenerationContent { choice_index, content, status, .. } => {
+                Some((*choice_index, content.clone(), status.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    generations.sort_by_key(|(idx, ..)| *idx);
+
+    assert_eq!(
+        generations,
+        vec![
+            (0, "partial output".to_string(), "partial".to_string()),
+            (1, "second choice output".to_string(), "partial".to_string()),
+        ]
+    );
 }
 #[tokio::test]
 async fn responses_must_forward_message_object_input() {

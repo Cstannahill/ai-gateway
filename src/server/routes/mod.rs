@@ -37,6 +37,7 @@ pub fn management_routes() -> Router<Arc<AppState>> {
 /// `analytics::require_pool`.
 pub fn analytics_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/analytics/summary", get(analytics::summary))
         .route("/v1/analytics/requests", get(analytics::list_requests))
         .route("/v1/analytics/requests/{request_id}", get(analytics::get_request))
         .route(
@@ -46,4 +47,5 @@ pub fn analytics_routes() -> Router<Arc<AppState>> {
         .route("/v1/analytics/providers/comparison", get(analytics::provider_comparison))
         .route("/v1/analytics/fallbacks", get(analytics::fallback_analysis))
         .route("/v1/analytics/costs", get(analytics::cost_summary))
+        .route("/v1/analytics/persistence", get(analytics::persistence_health))
 }

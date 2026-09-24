@@ -145,26 +145,73 @@ pub enum TelemetryEvent {
     },
 
     /// Token usage reported for an attempt.
+    ///
+    /// docs/frontend/API_GAPS.md item 2 asked what "finality" means for a
+    /// usage observation, since nothing previously distinguished a delta
+    /// from a running total from a confirmed final count. Researched
+    /// answer: every provider this gateway supports (OpenAI, OpenRouter,
+    /// llama.cpp/llama-server, vLLM, Ollama, Gemini's OpenAI-compat layer)
+    /// follows the same documented convention — usage is reported once per
+    /// attempt as a cumulative total for the whole response (in the final
+    /// SSE chunk when `stream_options.include_usage` is set, or in the
+    /// single non-streaming response body), never as incrementally
+    /// increasing per-chunk deltas. `kind` records this explicitly rather
+    /// than leaving it assumed, so a future provider that actually streams
+    /// deltas doesn't get silently misinterpreted.
     UsageRecorded {
         request_id: Uuid,
         attempt_number: u32,
         timestamp: DateTime<Utc>,
         usage: Usage,
+        /// Which code path produced this observation: `"stream_final"`
+        /// (the last chunk of a genuine live SSE stream) or
+        /// `"non_streaming"` (a single non-streaming response body,
+        /// including the synthesized-event path used to give non-streaming
+        /// responses a uniform internal representation — see
+        /// `InstrumentedStream`'s `synthetic` field).
+        source: String,
+        /// Always `"cumulative"` today — see the variant doc comment.
+        /// Reserved for `"delta"`/`"final"` if a provider is ever added
+        /// that doesn't follow the single-cumulative-total convention.
+        kind: String,
     },
 
-    /// The completed generation content.
+    /// The completed generation content for one choice of one attempt.
+    ///
+    /// One event per choice index — an `n > 1` request emits one of these
+    /// per choice, not one merged event for the whole attempt. Previously
+    /// all choices' content was accumulated into a single `String` with no
+    /// index at all, so a multi-choice response's individual choices were
+    /// unrecoverable once persisted (docs/frontend/API_GAPS.md item 5's
+    /// choice-ID gap).
     GenerationContent {
         request_id: Uuid,
         attempt_number: u32,
         timestamp: DateTime<Utc>,
+        /// Which choice this content belongs to. `0` for the overwhelmingly
+        /// common single-choice case.
+        choice_index: u32,
         /// Full generated text content (critical for dataset goal).
         content: String,
-        /// Full reasoning content (if exposed).
+        /// Full reasoning content (if exposed). Only ever populated for
+        /// `choice_index == 0` — reasoning has no per-choice index in the
+        /// provider-event model (`ProviderEvent::ReasoningDelta` carries no
+        /// `index` field), and reasoning-capable models are not commonly
+        /// combined with `n > 1` in practice. See the matching note in
+        /// `src/providers/openai_compatible.rs`.
         reasoning_content: Option<String>,
-        /// Tool calls (if any).
+        /// Tool calls for this choice (if any).
         tool_calls: Option<serde_json::Value>,
-        /// Raw provider response body.
+        /// Raw provider response body. Only ever populated on
+        /// `choice_index == 0`'s event — there is one raw body per
+        /// non-streaming attempt, not one per choice, so it would be
+        /// wasteful and misleading to repeat it on every choice's row.
         raw_response: Option<serde_json::Value>,
+        /// `"complete"` when reached via a genuine terminal `Completed`
+        /// event; `"partial"` when reached via a mid-stream `Error` with
+        /// whatever content had already accumulated preserved rather than
+        /// discarded (Audit A04).
+        status: String,
     },
 
     /// Cost information recorded.

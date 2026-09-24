@@ -240,6 +240,7 @@ pub async fn handle(
                         request_id,
                         attempt_number,
                         state.telemetry_tx.clone(),
+                        state.telemetry_health.clone(),
                         state.config.telemetry.store_stream_events,
                         !request.stream,
                     );

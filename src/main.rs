@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         start_time: std::time::Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         analytics_pool,
+        telemetry_health: telemetry.health(),
     });
 
     // ─── Snapshot configured models once at startup ───────────────────────

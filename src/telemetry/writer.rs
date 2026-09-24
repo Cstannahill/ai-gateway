@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -11,6 +12,7 @@ use tokio::time;
 use crate::config::PricingEntry;
 
 use super::events::{AttemptStatus, TelemetryEvent};
+use super::health::{TelemetryHealth, TelemetryMode};
 
 // ─── Telemetry Writer ────────────────────────────────────────────────────────
 //
@@ -44,6 +46,11 @@ pub struct TelemetryWriter {
     /// Deployment pricing, keyed by `"provider/model"`. See
     /// `GatewayConfig::pricing`'s doc comment.
     pricing: HashMap<String, PricingEntry>,
+    /// Shared, live health this writer updates on every flush/replay
+    /// outcome — see `docs/frontend/API_GAPS.md` item 8. Created fresh by
+    /// this writer (not passed in), exposed via `health()` for whoever
+    /// constructed the writer (`TelemetryPipeline`) to hand to `AppState`.
+    health: Arc<TelemetryHealth>,
 }
 
 impl TelemetryWriter {
@@ -104,6 +111,8 @@ impl TelemetryWriter {
             }
         };
 
+        let mode = if pool.is_some() { TelemetryMode::Database } else { TelemetryMode::Unavailable };
+
         let writer = Self {
             pool,
             batch_size,
@@ -112,6 +121,7 @@ impl TelemetryWriter {
             store_stream_events,
             fallback_log_path: fallback_log_path.into(),
             pricing,
+            health: Arc::new(TelemetryHealth::new(mode)),
         };
 
         // A prior run (this process restarting, or an entirely separate
@@ -122,6 +132,12 @@ impl TelemetryWriter {
         writer.replay_fallback_log().await;
 
         Ok(writer)
+    }
+
+    /// Get a handle to this writer's shared, live health — see
+    /// `docs/frontend/API_GAPS.md` item 8.
+    pub fn health(&self) -> Arc<TelemetryHealth> {
+        self.health.clone()
     }
 
     /// Run the writer loop — receives events and batches them for persistence.
@@ -208,6 +224,7 @@ impl TelemetryWriter {
                 Ok(()) => {
                     batch.clear();
                     tracing::debug!(count, "Telemetry batch flushed");
+                    self.health.record_flush_success(chrono::Utc::now());
                     return;
                 }
                 Err(e) => {
@@ -231,6 +248,7 @@ impl TelemetryWriter {
             path = %self.fallback_log_path.display(),
             "Telemetry batch failed after all retries; writing to fallback log instead of discarding"
         );
+        self.health.record_flush_failure();
         if let Err(e) = self.write_fallback_log(batch).await {
             tracing::error!(
                 error = %e,
@@ -372,6 +390,10 @@ impl TelemetryWriter {
             return;
         }
 
+        // The file exists and has real content — something is genuinely
+        // pending, regardless of how the replay attempt below turns out.
+        self.health.set_fallback_pending(true);
+
         let mut events = Vec::new();
         let mut malformed = 0u32;
         for line in contents.lines() {
@@ -394,6 +416,7 @@ impl TelemetryWriter {
             // Nothing parseable survived (e.g. the file was only ever
             // malformed lines) — clear it so this doesn't spin forever.
             let _ = tokio::fs::remove_file(&self.fallback_log_path).await;
+            self.health.set_fallback_pending(false);
             return;
         }
 
@@ -424,6 +447,7 @@ impl TelemetryWriter {
                 tracing::warn!(error = %e, "Replayed telemetry fallback log but could not remove it");
             }
             tracing::info!("Telemetry fallback log fully replayed and cleared");
+            self.health.set_fallback_pending(false);
         } else {
             let mut buf = String::new();
             for event in &remaining {
@@ -439,6 +463,7 @@ impl TelemetryWriter {
                      already-persisted events may be replayed again on the next attempt"
                 );
             }
+            self.health.set_fallback_pending(true);
         }
     }
 
@@ -694,7 +719,8 @@ impl TelemetryWriter {
                         upstream_provider = $6,
                         duration_us = $7,
                         error_code = $8,
-                        error_message = $9
+                        error_message = $9,
+                        finished_at = $10
                     WHERE request_id = $1 AND attempt_number = $2
                     "#,
                 )
@@ -707,18 +733,22 @@ impl TelemetryWriter {
                 .bind(*duration_us as i64)
                 .bind(error_code.as_deref())
                 .bind(error_message.as_deref())
+                .bind(timestamp)
                 .execute(&mut **tx)
                 .await?;
 
-                // If attempt was not pre-inserted, insert now
+                // If attempt was not pre-inserted, insert now. `timestamp`
+                // serves as both `timestamp` (started_at) and `finished_at`
+                // here since, in this edge case, no `ProviderAttemptStarted`
+                // was ever observed — this is the only timestamp available.
                 if res.rows_affected() == 0 {
                     sqlx::query(
                         r#"
                         INSERT INTO provider_attempts (
                             request_id, attempt_number, timestamp, provider, model, status,
                             finish_reason, provider_response_id, upstream_provider, duration_us,
-                            error_code, error_message
-                        ) VALUES ($1, $2, $3, 'unknown', 'unknown', $4, $5, $6, $7, $8, $9, $10)
+                            error_code, error_message, finished_at
+                        ) VALUES ($1, $2, $3, 'unknown', 'unknown', $4, $5, $6, $7, $8, $9, $10, $3)
                         "#,
                     )
                     .bind(request_id)
@@ -759,13 +789,15 @@ impl TelemetryWriter {
                 attempt_number,
                 timestamp,
                 usage,
+                source,
+                kind,
             } => {
                 sqlx::query(
                     r#"
                     INSERT INTO generation_usage (
                         request_id, attempt_number, timestamp, prompt_tokens, completion_tokens,
-                        total_tokens, cached_tokens, reasoning_tokens, raw_provider_usage
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        total_tokens, cached_tokens, reasoning_tokens, raw_provider_usage, source, kind
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     "#,
                 )
                 .bind(request_id)
@@ -777,6 +809,8 @@ impl TelemetryWriter {
                 .bind(usage.cached_tokens.map(|v| v as i64))
                 .bind(usage.reasoning_tokens.map(|v| v as i64))
                 .bind(&usage.raw_provider_usage)
+                .bind(source)
+                .bind(kind)
                 .execute(&mut **tx)
                 .await?;
 
@@ -841,10 +875,12 @@ impl TelemetryWriter {
                 request_id,
                 attempt_number,
                 timestamp,
+                choice_index,
                 content,
                 reasoning_content,
                 tool_calls,
                 raw_response,
+                status,
             } => {
                 let raw_resp = if self.store_raw_bodies {
                     raw_response.as_ref()
@@ -861,9 +897,14 @@ impl TelemetryWriter {
                 // `UsageRecorded` event for this attempt already landed
                 // with reasoning_tokens > 0, mark it `count_only` instead;
                 // the reverse ordering (usage arriving after this insert)
-                // is handled in the UsageRecorded branch below.
+                // is handled in the UsageRecorded branch below. Reasoning
+                // is never attributed to a non-zero choice index (see
+                // `TelemetryEvent::GenerationContent`'s field docs), so
+                // there's nothing to look up for those — always `none`.
                 let visibility = if reasoning_content.is_some() {
                     "exposed"
+                } else if *choice_index != 0 {
+                    "none"
                 } else {
                     let reasoning_tokens_reported: Option<i64> = sqlx::query_scalar(
                         r#"
@@ -887,19 +928,21 @@ impl TelemetryWriter {
                 sqlx::query(
                     r#"
                     INSERT INTO generations (
-                        request_id, attempt_number, timestamp, content, reasoning_content,
-                        reasoning_visibility, tool_calls, raw_response
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        request_id, attempt_number, choice_index, timestamp, content,
+                        reasoning_content, reasoning_visibility, tool_calls, raw_response, status
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     "#,
                 )
                 .bind(request_id)
                 .bind(*attempt_number as i32)
+                .bind(*choice_index as i32)
                 .bind(timestamp)
                 .bind(content)
                 .bind(reasoning_content.as_deref())
                 .bind(visibility)
                 .bind(tool_calls)
                 .bind(raw_resp)
+                .bind(status)
                 .execute(&mut **tx)
                 .await?;
 

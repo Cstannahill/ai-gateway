@@ -168,12 +168,16 @@ async fn reasoning_visibility_is_correct_regardless_of_event_order() {
             reasoning_content: None,
             tool_calls: None,
             raw_response: None,
+            choice_index: 0,
+            status: "complete".to_string(),
         },
         TelemetryEvent::UsageRecorded {
             request_id: content_then_usage,
             attempt_number: 1,
             timestamp: Utc::now(),
             usage: usage_with_reasoning(),
+            source: "non_streaming".to_string(),
+            kind: "cumulative".to_string(),
         },
         // Scenario 2: UsageRecorded arrives first — GenerationContent must
         // look it up and write 'count_only' directly.
@@ -184,6 +188,8 @@ async fn reasoning_visibility_is_correct_regardless_of_event_order() {
             attempt_number: 1,
             timestamp: Utc::now(),
             usage: usage_with_reasoning(),
+            source: "non_streaming".to_string(),
+            kind: "cumulative".to_string(),
         },
         TelemetryEvent::GenerationContent {
             request_id: usage_then_content,
@@ -193,6 +199,8 @@ async fn reasoning_visibility_is_correct_regardless_of_event_order() {
             reasoning_content: None,
             tool_calls: None,
             raw_response: None,
+            choice_index: 0,
+            status: "complete".to_string(),
         },
         // Scenario 3: reasoning text was actually exposed.
         request_received(exposed, "m"),
@@ -205,6 +213,8 @@ async fn reasoning_visibility_is_correct_regardless_of_event_order() {
             reasoning_content: Some("because...".to_string()),
             tool_calls: None,
             raw_response: None,
+            choice_index: 0,
+            status: "complete".to_string(),
         },
         // Scenario 4: no reasoning at all.
         request_received(plain_none, "m"),
@@ -217,6 +227,8 @@ async fn reasoning_visibility_is_correct_regardless_of_event_order() {
             reasoning_content: None,
             tool_calls: None,
             raw_response: None,
+            choice_index: 0,
+            status: "complete".to_string(),
         },
     ];
 
@@ -337,6 +349,8 @@ async fn cost_record_is_computed_when_pricing_is_configured() {
                 reasoning_tokens: None,
                 raw_provider_usage: None,
             },
+            source: "non_streaming".to_string(),
+            kind: "cumulative".to_string(),
         },
     ];
 
@@ -356,4 +370,34 @@ async fn cost_record_is_computed_when_pricing_is_configured() {
     assert!((estimated_cost - 2.0).abs() < 1e-9, "got {estimated_cost}");
     assert!((input_cost - 1.0).abs() < 1e-9, "got {input_cost}");
     assert!((output_cost - 1.0).abs() < 1e-9, "got {output_cost}");
+}
+
+#[tokio::test]
+async fn writer_health_reflects_a_real_successful_flush() {
+    // docs/frontend/API_GAPS.md item 8 (persistence-health half): the
+    // health snapshot `GET /v1/analytics/persistence` reads must actually
+    // reflect what the writer did, not just report a static default. This
+    // drives a real flush against a real database and checks the same
+    // `Arc<TelemetryHealth>` handle the writer updates in place.
+    let Some((writer, _pool)) = writer_and_pool().await else {
+        eprintln!("skipping writer_health_reflects_a_real_successful_flush: AUDIT_DATABASE_URL not set");
+        return;
+    };
+
+    let health = writer.health();
+    let snapshot_before = health.snapshot();
+    assert_eq!(snapshot_before.mode, "database");
+    // No flush has happened yet — must not be misreported as a failure.
+    assert!(snapshot_before.last_flush_ok);
+    assert!(snapshot_before.last_flush_at.is_none());
+
+    let request_id = Uuid::now_v7();
+    run_events(writer, vec![request_received(request_id, "writer-health-test-model")]).await;
+
+    let snapshot_after = health.snapshot();
+    assert_eq!(snapshot_after.mode, "database");
+    assert!(snapshot_after.last_flush_ok);
+    assert!(snapshot_after.last_flush_at.is_some(), "a real flush happened and must be recorded");
+    assert_eq!(snapshot_after.consecutive_flush_failures, 0);
+    assert!(!snapshot_after.fallback_pending);
 }

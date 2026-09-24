@@ -180,6 +180,11 @@ pub async fn handle(
                                 reasoning_tokens: None,
                                 raw_provider_usage: Some(usage.clone()),
                             },
+                            // Embeddings has no streaming concept — always a
+                            // single non-streaming response body. See
+                            // docs/frontend/API_GAPS.md item 2.
+                            source: "non_streaming".to_string(),
+                            kind: "cumulative".to_string(),
                         });
                     }
 

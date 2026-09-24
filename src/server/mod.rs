@@ -18,7 +18,7 @@ use tower_http::trace::TraceLayer;
 use crate::config::GatewayConfig;
 use crate::registry::{ModelRegistry, ProviderRegistry};
 use crate::routing::Router as RoutingEngine;
-use crate::telemetry::TelemetryEvent;
+use crate::telemetry::{TelemetryEvent, TelemetryHealth};
 
 /// Shared application state available to all route handlers.
 pub struct AppState {
@@ -41,6 +41,12 @@ pub struct AppState {
     /// database was unreachable at startup — analytics endpoints return
     /// `503` rather than panicking (docs/REMEDIATION_PLAN.md Phase 4.1).
     pub analytics_pool: Option<sqlx::PgPool>,
+    /// Live telemetry pipeline health (flush outcomes, dropped-event
+    /// counts, fallback-log state) — distinct from `/health`'s
+    /// provider-only view. Backs `GET /v1/analytics/persistence`
+    /// (docs/frontend/API_GAPS.md item 8, persistence-health half only —
+    /// auth is out of scope for this personal, loopback-only deployment).
+    pub telemetry_health: Arc<TelemetryHealth>,
 }
 
 impl AppState {
@@ -48,6 +54,7 @@ impl AppState {
     pub fn emit_telemetry(&self, event: TelemetryEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.telemetry_tx.try_send(event) {
             tracing::warn!("Telemetry queue full; event dropped");
+            self.telemetry_health.record_dropped_event();
         }
     }
 

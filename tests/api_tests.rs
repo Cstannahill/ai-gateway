@@ -26,6 +26,7 @@ fn setup_test_app() -> axum::Router {
         telemetry_tx,
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         analytics_pool: None,
     });
 
@@ -170,6 +171,7 @@ async fn test_gateway_request_counter_counts_actual_requests() {
         telemetry_tx,
         start_time: Instant::now(),
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         analytics_pool: None,
     });
 
@@ -193,4 +195,100 @@ async fn test_gateway_request_counter_counts_actual_requests() {
     }
 
     assert_eq!(state.gateway_request_count(), 2);
+}
+
+#[tokio::test]
+async fn test_persistence_health_endpoint_works_without_analytics_pool() {
+    // Unlike every other `/v1/analytics/*` endpoint, persistence health
+    // reports on the write-side pipeline, not the read-side query pool —
+    // it must not 503 just because `analytics_pool` is `None`
+    // (docs/frontend/API_GAPS.md item 8).
+    let app = setup_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/analytics/persistence")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // `setup_test_app` wires a `Disabled`-mode health handle.
+    assert_eq!(json["mode"], "disabled");
+    assert_eq!(json["healthy"], false);
+    assert!(json["channel"]["capacity"].is_number());
+    assert_eq!(json["dropped_events_total"], 0);
+}
+
+#[tokio::test]
+async fn test_persistence_health_counts_dropped_events_and_channel_backlog() {
+    // A full telemetry channel must be reflected honestly: dropped events
+    // counted, and the backlog visible — not silently absorbed.
+    use ai_gateway::telemetry::{TelemetryHealth, TelemetryMode};
+
+    let config = GatewayConfig::load(None).unwrap();
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let provider_registry = ProviderRegistry::new();
+    let router = RoutingEngine::new("priority".to_string());
+    // Capacity 1 so the second send finds the channel full.
+    let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(1);
+    let telemetry_health = Arc::new(TelemetryHealth::new(TelemetryMode::Database));
+
+    let state = Arc::new(AppState {
+        config,
+        model_registry,
+        provider_registry,
+        router,
+        telemetry_tx,
+        start_time: Instant::now(),
+        total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        telemetry_health,
+        analytics_pool: None,
+    });
+
+    // Fill the one slot, then overflow it twice.
+    state.emit_telemetry(ai_gateway::telemetry::TelemetryEvent::RequestCompleted {
+        request_id: uuid::Uuid::now_v7(),
+        timestamp: chrono::Utc::now(),
+        total_latency_us: 0,
+        total_attempts: 0,
+        serving_provider: None,
+        resolved_model: None,
+        success: true,
+    });
+    for _ in 0..2 {
+        state.emit_telemetry(ai_gateway::telemetry::TelemetryEvent::RequestCompleted {
+            request_id: uuid::Uuid::now_v7(),
+            timestamp: chrono::Utc::now(),
+            total_latency_us: 0,
+            total_attempts: 0,
+            serving_provider: None,
+            resolved_model: None,
+            success: true,
+        });
+    }
+
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/analytics/persistence")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["mode"], "database");
+    assert_eq!(json["dropped_events_total"], 2, "{json}");
+    assert_eq!(json["channel"]["capacity"], 1, "{json}");
+    assert_eq!(json["channel"]["pending"], 1, "{json}");
 }

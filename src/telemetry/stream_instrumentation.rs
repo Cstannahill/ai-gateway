@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
@@ -9,6 +10,7 @@ use uuid::Uuid;
 
 use crate::providers::events::ProviderEvent;
 use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
+use crate::telemetry::health::TelemetryHealth;
 use crate::types::Usage;
 
 // ─── Stream Instrumentation ──────────────────────────────────────────────────
@@ -32,6 +34,7 @@ pin_project! {
         request_id: Uuid,
         attempt_number: u32,
         telemetry_tx: mpsc::Sender<TelemetryEvent>,
+        telemetry_health: Arc<TelemetryHealth>,
         sequence: u64,
         first_content_seen: bool,
         // A monotonic clock, not `DateTime<Utc>` subtraction, for the
@@ -42,9 +45,17 @@ pin_project! {
         // returns the stream), which is close enough to the adapter's own
         // `Started` event for this purpose.
         started_instant: std::time::Instant,
-        accumulated_content: String,
+        // Keyed by choice index — an `n > 1` request accumulates each
+        // choice's content separately so it can be persisted as its own
+        // `GenerationContent` event/row instead of one merged blob
+        // (docs/frontend/API_GAPS.md item 5's choice-ID gap).
+        accumulated_content: BTreeMap<u32, String>,
+        // Reasoning has no per-choice index in the provider-event model
+        // (`ReasoningDelta` carries none) — always attributed to choice 0,
+        // same scoping decision as `openai_compatible.rs`'s event parsing.
         accumulated_reasoning: String,
-        tool_calls_map: BTreeMap<u32, (Option<String>, Option<String>, String)>,
+        // Outer key: choice index. Inner key: tool_call_index.
+        tool_calls_map: BTreeMap<u32, BTreeMap<u32, (Option<String>, Option<String>, String)>>,
         store_stream_events: bool,
         // True when `inner` is not a genuine live provider stream but a
         // one-shot sequence of events reconstructed from a single
@@ -62,6 +73,7 @@ impl InstrumentedStream {
         request_id: Uuid,
         attempt_number: u32,
         telemetry_tx: mpsc::Sender<TelemetryEvent>,
+        telemetry_health: Arc<TelemetryHealth>,
         store_stream_events: bool,
         synthetic: bool,
     ) -> Self {
@@ -70,10 +82,11 @@ impl InstrumentedStream {
             request_id,
             attempt_number,
             telemetry_tx,
+            telemetry_health,
             sequence: 0,
             first_content_seen: false,
             started_instant: std::time::Instant::now(),
-            accumulated_content: String::new(),
+            accumulated_content: BTreeMap::new(),
             accumulated_reasoning: String::new(),
             tool_calls_map: BTreeMap::new(),
             store_stream_events,
@@ -82,10 +95,85 @@ impl InstrumentedStream {
     }
 }
 
-/// Fire-and-forget telemetry emit — never blocks the stream, but warns if channel is full.
-fn emit(tx: &mpsc::Sender<TelemetryEvent>, event: TelemetryEvent) {
+/// Fire-and-forget telemetry emit — never blocks the stream, but warns (and
+/// records the drop for `/v1/analytics/persistence`) if the channel is full.
+fn emit(tx: &mpsc::Sender<TelemetryEvent>, health: &TelemetryHealth, event: TelemetryEvent) {
     if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
         tracing::warn!("Telemetry queue full; stream event dropped");
+        health.record_dropped_event();
+    }
+}
+
+/// Emits one `GenerationContent` event per choice index present in
+/// `accumulated_content` or `tool_calls_map` — an `n > 1` attempt gets one
+/// event per choice instead of one event merging every choice together
+/// (docs/frontend/API_GAPS.md item 5's choice-ID gap). Reasoning and the
+/// raw response body are only ever attached to choice 0's event; see the
+/// matching field docs on `TelemetryEvent::GenerationContent`.
+#[allow(clippy::too_many_arguments)]
+fn emit_generation_content_per_choice(
+    tx: &mpsc::Sender<TelemetryEvent>,
+    health: &TelemetryHealth,
+    request_id: Uuid,
+    attempt_number: u32,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    accumulated_content: &BTreeMap<u32, String>,
+    accumulated_reasoning: &str,
+    tool_calls_map: &BTreeMap<u32, BTreeMap<u32, (Option<String>, Option<String>, String)>>,
+    raw_response: Option<serde_json::Value>,
+    status: &str,
+) {
+    let mut choice_indices: BTreeSet<u32> = accumulated_content.keys().copied().collect();
+    choice_indices.extend(tool_calls_map.keys().copied());
+    if choice_indices.is_empty() {
+        // No content and no tool calls for any choice at all (e.g. an
+        // attempt that failed before any delta arrived) — still emit a
+        // single empty choice-0 event so a request always has *some*
+        // generation row, matching the prior single-choice behavior.
+        choice_indices.insert(0);
+    }
+
+    for choice_index in choice_indices {
+        let content = accumulated_content.get(&choice_index).cloned().unwrap_or_default();
+
+        let tool_calls_json: Vec<serde_json::Value> = tool_calls_map
+            .get(&choice_index)
+            .map(|calls| {
+                calls
+                    .values()
+                    .map(|(id, name, args)| {
+                        serde_json::json!({
+                            "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                            "type": "function",
+                            "function": {
+                                "name": name.clone().unwrap_or_default(),
+                                "arguments": args.clone(),
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        emit(tx, health, TelemetryEvent::GenerationContent {
+            request_id,
+            attempt_number,
+            timestamp,
+            choice_index,
+            content,
+            reasoning_content: if choice_index == 0 && !accumulated_reasoning.is_empty() {
+                Some(accumulated_reasoning.to_string())
+            } else {
+                None
+            },
+            tool_calls: if tool_calls_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&tool_calls_json).unwrap_or_default())
+            },
+            raw_response: if choice_index == 0 { raw_response.clone() } else { None },
+            status: status.to_string(),
+        });
     }
 }
 
@@ -115,7 +203,7 @@ impl Stream for InstrumentedStream {
                     }
 
                     ProviderEvent::Connected { timestamp, connection_latency_us } => {
-                        emit(this.telemetry_tx, TelemetryEvent::ProviderConnected {
+                        emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::ProviderConnected {
                             request_id: *this.request_id,
                             attempt_number: *this.attempt_number,
                             timestamp: *timestamp,
@@ -128,7 +216,7 @@ impl Stream for InstrumentedStream {
                     // never from real execution (docs/REMEDIATION_PLAN.md
                     // Phase 3.1 / Audit A06).
                     ProviderEvent::FirstByte { timestamp } => {
-                        emit(this.telemetry_tx, TelemetryEvent::FirstProviderByte {
+                        emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::FirstProviderByte {
                             request_id: *this.request_id,
                             attempt_number: *this.attempt_number,
                             timestamp: *timestamp,
@@ -136,10 +224,10 @@ impl Stream for InstrumentedStream {
                         });
                     }
 
-                    ProviderEvent::ContentDelta { timestamp, delta, .. } => {
+                    ProviderEvent::ContentDelta { timestamp, delta, index } => {
                         if !*this.first_content_seen {
                             *this.first_content_seen = true;
-                            emit(this.telemetry_tx, TelemetryEvent::FirstGenerationChunk {
+                            emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::FirstGenerationChunk {
                                 request_id: *this.request_id,
                                 attempt_number: *this.attempt_number,
                                 timestamp: *timestamp,
@@ -148,10 +236,10 @@ impl Stream for InstrumentedStream {
                             });
                         }
 
-                        this.accumulated_content.push_str(delta);
+                        this.accumulated_content.entry(*index).or_default().push_str(delta);
 
                         if *this.store_stream_events {
-                            emit(this.telemetry_tx, TelemetryEvent::StreamChunk {
+                            emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::StreamChunk {
                                 request_id: *this.request_id,
                                 attempt_number: *this.attempt_number,
                                 timestamp: *timestamp,
@@ -167,7 +255,7 @@ impl Stream for InstrumentedStream {
                         this.accumulated_reasoning.push_str(delta);
 
                         if *this.store_stream_events {
-                            emit(this.telemetry_tx, TelemetryEvent::StreamChunk {
+                            emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::StreamChunk {
                                 request_id: *this.request_id,
                                 attempt_number: *this.attempt_number,
                                 timestamp: *timestamp,
@@ -181,14 +269,16 @@ impl Stream for InstrumentedStream {
 
                     ProviderEvent::ToolCallDelta {
                         timestamp,
+                        index,
                         tool_call_index,
                         id,
                         name,
                         arguments,
-                        ..
                     } => {
                         let entry = this
                             .tool_calls_map
+                            .entry(*index)
+                            .or_default()
                             .entry(*tool_call_index)
                             .or_insert_with(|| (None, None, String::new()));
                         if let Some(id_str) = id {
@@ -202,7 +292,7 @@ impl Stream for InstrumentedStream {
                         }
 
                         if *this.store_stream_events {
-                            emit(this.telemetry_tx, TelemetryEvent::StreamChunk {
+                            emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::StreamChunk {
                                 request_id: *this.request_id,
                                 attempt_number: *this.attempt_number,
                                 timestamp: *timestamp,
@@ -223,7 +313,7 @@ impl Stream for InstrumentedStream {
                         reasoning_tokens,
                         raw_usage,
                     } => {
-                        emit(this.telemetry_tx, TelemetryEvent::UsageRecorded {
+                        emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::UsageRecorded {
                             request_id: *this.request_id,
                             attempt_number: *this.attempt_number,
                             timestamp: *timestamp,
@@ -235,6 +325,8 @@ impl Stream for InstrumentedStream {
                                 reasoning_tokens: *reasoning_tokens,
                                 raw_provider_usage: raw_usage.clone(),
                             },
+                            source: if *this.synthetic { "non_streaming" } else { "stream_final" }.to_string(),
+                            kind: "cumulative".to_string(),
                         });
                     }
 
@@ -247,47 +339,20 @@ impl Stream for InstrumentedStream {
                     } => {
                         let duration_us = this.started_instant.elapsed().as_micros() as u64;
 
-                        let tool_calls_json: Vec<serde_json::Value> = this
-                            .tool_calls_map
-                            .values()
-                            .map(|(id, name, args)| {
-                                serde_json::json!({
-                                    "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
-                                    "type": "function",
-                                    "function": {
-                                        "name": name.clone().unwrap_or_default(),
-                                        "arguments": args.clone(),
-                                    }
-                                })
-                            })
-                            .collect();
+                        emit_generation_content_per_choice(
+                            this.telemetry_tx,
+                            this.telemetry_health,
+                            *this.request_id,
+                            *this.attempt_number,
+                            *timestamp,
+                            this.accumulated_content,
+                            &this.accumulated_reasoning,
+                            this.tool_calls_map,
+                            raw_response.clone(),
+                            "complete",
+                        );
 
-                        // Emit the full generation content.
-                        emit(this.telemetry_tx, TelemetryEvent::GenerationContent {
-                            request_id: *this.request_id,
-                            attempt_number: *this.attempt_number,
-                            timestamp: *timestamp,
-                            content: this.accumulated_content.clone(),
-                            reasoning_content: if this.accumulated_reasoning.is_empty() {
-                                None
-                            } else {
-                                Some(this.accumulated_reasoning.clone())
-                            },
-                            tool_calls: if tool_calls_json.is_empty() {
-                                None
-                            } else {
-                                Some(serde_json::to_value(&tool_calls_json).unwrap_or_default())
-                            },
-                            // Previously always None regardless of the
-                            // `store_raw_bodies` config flag — now forwards
-                            // whatever the adapter captured (the full body
-                            // for non-streaming requests, None for a real
-                            // SSE stream). The writer still gates storage on
-                            // `store_raw_bodies` itself.
-                            raw_response: raw_response.clone(),
-                        });
-
-                        emit(this.telemetry_tx, TelemetryEvent::ProviderAttemptCompleted {
+                        emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::ProviderAttemptCompleted {
                             request_id: *this.request_id,
                             attempt_number: *this.attempt_number,
                             timestamp: *timestamp,
@@ -315,41 +380,21 @@ impl Stream for InstrumentedStream {
                         // Completed event, so an error mid-stream discarded
                         // everything generated so far (Audit A04).
                         if !this.accumulated_content.is_empty() || !this.accumulated_reasoning.is_empty() {
-                            let tool_calls_json: Vec<serde_json::Value> = this
-                                .tool_calls_map
-                                .values()
-                                .map(|(id, name, args)| {
-                                    serde_json::json!({
-                                        "id": id.clone().unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
-                                        "type": "function",
-                                        "function": {
-                                            "name": name.clone().unwrap_or_default(),
-                                            "arguments": args.clone(),
-                                        }
-                                    })
-                                })
-                                .collect();
-
-                            emit(this.telemetry_tx, TelemetryEvent::GenerationContent {
-                                request_id: *this.request_id,
-                                attempt_number: *this.attempt_number,
-                                timestamp: *timestamp,
-                                content: this.accumulated_content.clone(),
-                                reasoning_content: if this.accumulated_reasoning.is_empty() {
-                                    None
-                                } else {
-                                    Some(this.accumulated_reasoning.clone())
-                                },
-                                tool_calls: if tool_calls_json.is_empty() {
-                                    None
-                                } else {
-                                    Some(serde_json::to_value(&tool_calls_json).unwrap_or_default())
-                                },
-                                raw_response: None,
-                            });
+                            emit_generation_content_per_choice(
+                                this.telemetry_tx,
+                                this.telemetry_health,
+                                *this.request_id,
+                                *this.attempt_number,
+                                *timestamp,
+                                this.accumulated_content,
+                                &this.accumulated_reasoning,
+                                this.tool_calls_map,
+                                None,
+                                "partial",
+                            );
                         }
 
-                        emit(this.telemetry_tx, TelemetryEvent::ProviderAttemptCompleted {
+                        emit(this.telemetry_tx, this.telemetry_health, TelemetryEvent::ProviderAttemptCompleted {
                             request_id: *this.request_id,
                             attempt_number: *this.attempt_number,
                             timestamp: *timestamp,
