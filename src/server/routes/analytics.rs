@@ -36,6 +36,10 @@ fn db_unavailable() -> Response {
         .into_response()
 }
 
+// `Response` is ~128 bytes, tripping clippy's `result_large_err` — not worth
+// boxing across this function's 8 call sites for a value returned once per
+// incoming HTTP request, not in a hot per-token loop.
+#[allow(clippy::result_large_err)]
 fn require_pool(state: &AppState) -> Result<&PgPool, Response> {
     state.analytics_pool.as_ref().ok_or_else(db_unavailable)
 }

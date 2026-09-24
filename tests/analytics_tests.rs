@@ -364,6 +364,15 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
     let writer = TelemetryWriter::new(&url, 2, 100, 60_000, true, true).await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
 
+    // Run-unique provider/model names, same convention used elsewhere in
+    // this file — `provider_comparison` aggregates by provider+model, not
+    // by request, so a static name here would collide with this same
+    // test's own data from a prior run against a persistent (non-reset)
+    // database and inflate the attempt count this test asserts on.
+    let run_id = Uuid::now_v7();
+    let provider_name = format!("dup-usage-provider-{run_id}");
+    let model_name = format!("dup-usage-model-{run_id}");
+
     let request_id = Uuid::now_v7();
     let events = vec![
         TelemetryEvent::RequestReceived {
@@ -373,7 +382,7 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
             application: None,
             task: None,
             tags: vec![],
-            requested_model: "dup-usage-model".to_string(),
+            requested_model: model_name.clone(),
             streaming: false,
             canonical_messages: None,
             raw_request: None,
@@ -386,8 +395,8 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
             request_id,
             attempt_number: 1,
             timestamp: Utc::now(),
-            provider: "dup-usage-provider".to_string(),
-            model: "dup-usage-model".to_string(),
+            provider: provider_name.clone(),
+            model: model_name.clone(),
         },
         // Two cumulative usage updates for the *same* attempt — a
         // realistic sequence, not a contrived edge case.
@@ -469,7 +478,7 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
         .as_array()
         .unwrap()
         .iter()
-        .find(|p| p["provider"] == "dup-usage-provider")
+        .find(|p| p["provider"] == provider_name)
         .unwrap_or_else(|| panic!("seeded provider not found: {body}"));
 
     assert_eq!(row["total_attempts"], 1, "two usage rows must not multiply the attempt count");
@@ -1095,29 +1104,29 @@ async fn analytics_requests_supports_attempted_provider_application_task_and_tag
 
     // `attempted_provider` must find it via the failed first attempt, even
     // though that provider never served the request.
-    let (status, body) = get(state.clone(), &format!("/v1/analytics/requests?attempted_provider=filter-test-attempted-only")).await;
+    let (status, body) = get(state.clone(), "/v1/analytics/requests?attempted_provider=filter-test-attempted-only").await;
     assert_eq!(status, StatusCode::OK);
     assert!(found(&body), "{body}");
 
     // `provider` (serving_provider) must NOT match the attempted-but-failed
     // provider — that's exactly the distinction item 6 asked for.
-    let (status, body) = get(state.clone(), &"/v1/analytics/requests?provider=filter-test-attempted-only".to_string()).await;
+    let (status, body) = get(state.clone(), "/v1/analytics/requests?provider=filter-test-attempted-only").await;
     assert_eq!(status, StatusCode::OK);
     assert!(!found(&body), "attempted-only provider must not match the serving_provider filter: {body}");
 
-    let (status, body) = get(state.clone(), &"/v1/analytics/requests?provider=filter-test-serving".to_string()).await;
+    let (status, body) = get(state.clone(), "/v1/analytics/requests?provider=filter-test-serving").await;
     assert_eq!(status, StatusCode::OK);
     assert!(found(&body), "{body}");
 
-    let (status, body) = get(state.clone(), &"/v1/analytics/requests?application=filter-test-app".to_string()).await;
+    let (status, body) = get(state.clone(), "/v1/analytics/requests?application=filter-test-app").await;
     assert_eq!(status, StatusCode::OK);
     assert!(found(&body), "{body}");
 
-    let (status, body) = get(state.clone(), &"/v1/analytics/requests?task=filter-test-task".to_string()).await;
+    let (status, body) = get(state.clone(), "/v1/analytics/requests?task=filter-test-task").await;
     assert_eq!(status, StatusCode::OK);
     assert!(found(&body), "{body}");
 
-    let (status, body) = get(state, &"/v1/analytics/requests?tag=filter-test-tag".to_string()).await;
+    let (status, body) = get(state, "/v1/analytics/requests?tag=filter-test-tag").await;
     assert_eq!(status, StatusCode::OK);
     assert!(found(&body), "{body}");
 }

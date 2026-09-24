@@ -137,10 +137,10 @@ impl TelemetryPipeline {
     pub async fn shutdown(self) {
         let Self { sender, writer_handle, health: _ } = self;
         drop(sender);
-        if let Some(handle) = writer_handle {
-            if let Err(e) = handle.await {
-                tracing::warn!(error = %e, "Telemetry writer task did not shut down cleanly");
-            }
+        if let Some(handle) = writer_handle
+            && let Err(e) = handle.await
+        {
+            tracing::warn!(error = %e, "Telemetry writer task did not shut down cleanly");
         }
     }
 

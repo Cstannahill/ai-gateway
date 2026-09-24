@@ -112,6 +112,10 @@ impl ResponseCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Build a canonical cache key from the semantically-relevant fields of a
@@ -190,7 +194,7 @@ mod tests {
         // Different request_id/received_at (as every real request has) must
         // not affect the key.
         r2.request_id = uuid::Uuid::now_v7();
-        r2.received_at = r2.received_at + chrono::Duration::seconds(5);
+        r2.received_at += chrono::Duration::seconds(5);
         assert_eq!(cache_key_for(&r1), cache_key_for(&r2));
 
         r1.model = "different-model".to_string();

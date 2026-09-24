@@ -27,6 +27,10 @@ use crate::types::Usage;
 // Content is accumulated in-memory for the GenerationContent event
 // at stream end (full text needed for dataset reconstruction).
 
+/// Per-choice tool-call accumulator: choice index → tool_call index →
+/// (id, function name, accumulated JSON arguments).
+type ToolCallsMap = BTreeMap<u32, BTreeMap<u32, (Option<String>, Option<String>, String)>>;
+
 pin_project! {
     pub struct InstrumentedStream {
         #[pin]
@@ -55,7 +59,7 @@ pin_project! {
         // same scoping decision as `openai_compatible.rs`'s event parsing.
         accumulated_reasoning: String,
         // Outer key: choice index. Inner key: tool_call_index.
-        tool_calls_map: BTreeMap<u32, BTreeMap<u32, (Option<String>, Option<String>, String)>>,
+        tool_calls_map: ToolCallsMap,
         store_stream_events: bool,
         // True when `inner` is not a genuine live provider stream but a
         // one-shot sequence of events reconstructed from a single
@@ -119,7 +123,7 @@ fn emit_generation_content_per_choice(
     timestamp: chrono::DateTime<chrono::Utc>,
     accumulated_content: &BTreeMap<u32, String>,
     accumulated_reasoning: &str,
-    tool_calls_map: &BTreeMap<u32, BTreeMap<u32, (Option<String>, Option<String>, String)>>,
+    tool_calls_map: &ToolCallsMap,
     raw_response: Option<serde_json::Value>,
     status: &str,
 ) {
@@ -346,7 +350,7 @@ impl Stream for InstrumentedStream {
                             *this.attempt_number,
                             *timestamp,
                             this.accumulated_content,
-                            &this.accumulated_reasoning,
+                            this.accumulated_reasoning,
                             this.tool_calls_map,
                             raw_response.clone(),
                             "complete",
@@ -387,7 +391,7 @@ impl Stream for InstrumentedStream {
                                 *this.attempt_number,
                                 *timestamp,
                                 this.accumulated_content,
-                                &this.accumulated_reasoning,
+                                this.accumulated_reasoning,
                                 this.tool_calls_map,
                                 None,
                                 "partial",
