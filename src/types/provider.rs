@@ -63,9 +63,26 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
 
+    /// Consecutive attempt failures (see `ProviderRegistry::record_request_end`)
+    /// before the circuit opens and this provider is skipped by routing.
+    /// `None` (the default) disables the breaker entirely — matches
+    /// `max_concurrent`'s opt-in shape so existing configs are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker_threshold: Option<u32>,
+
+    /// How long the circuit stays open before allowing one trial request
+    /// through (half-open) to test recovery. Only meaningful when
+    /// `circuit_breaker_threshold` is set.
+    #[serde(default = "default_circuit_breaker_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
+
     /// Whether this provider is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+fn default_circuit_breaker_cooldown_secs() -> u64 {
+    30
 }
 
 fn default_timeout() -> u64 {
@@ -119,4 +136,10 @@ pub struct ProviderStatus {
     /// never used for routing decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_health_check_latency_ms: Option<f64>,
+
+    /// Circuit breaker state: `"closed"` (normal), `"open"` (routing skips
+    /// this provider entirely), or `"half_open"` (cooldown elapsed, one
+    /// trial request is being let through to test recovery). Always
+    /// `"closed"` when `circuit_breaker_threshold` isn't configured.
+    pub circuit_state: String,
 }

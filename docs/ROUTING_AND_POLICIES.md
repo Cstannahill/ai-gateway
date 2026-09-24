@@ -109,6 +109,13 @@ Every candidate's provider status is checked against [`ProviderRegistry::is_avai
 
 A second, independent check follows: if the provider has a configured `max_concurrent`, its current in-flight request count (tracked by `ProviderRegistry::record_request_start`/`record_request_end`) must be below that limit, or the candidate is rejected with reason `"provider_at_capacity"` — a distinct reason from `"provider_unavailable"` since it's transient load, not a config/health problem. This check also applies to explicit `provider/model` addressing (Stage 1/2's short-circuits): `max_concurrent` is a resource-protection constraint, not a routing preference, so — like the administrative `enabled` switch — it is not bypassable by explicit addressing (docs/REMEDIATION_PLAN.md Phase 5.3).
 
+A third check, same shape: if the provider has a configured `circuit_breaker_threshold`, `ProviderRegistry::is_circuit_open` is consulted and a tripped circuit rejects the candidate with reason `"provider_circuit_open"` — also not bypassable by explicit addressing, for the same resource-protection rationale. The breaker is a simple three-state machine per provider (`ProviderRegistry::record_request_end` drives the transitions):
+- **Closed** (default): normal operation. `circuit_breaker_threshold` *consecutive* attempt failures (any success resets the counter to zero) trip it to Open.
+- **Open**: every candidate check rejects with `"provider_circuit_open"` until `circuit_breaker_cooldown_secs` has elapsed since it opened, at which point the *next* routing check (there's no background timer — a single-user gateway may sit idle between requests) transitions it to HalfOpen.
+- **HalfOpen**: one (or more — there's no dedicated single-trial lock) request is let through as a recovery probe. A success closes the circuit; a failure re-opens it with a fresh cooldown.
+
+Distinguish this from the per-attempt retry/fallback logic below: fallback reacts to a single request's outcome and moves to the next candidate *within that request*; the circuit breaker persists state *across requests*, so a provider that has been consistently failing is skipped pre-emptively on the very next request rather than being retried and only then falling back, every time. See `docs/CONFIGURATION_GUIDE.md` for the config fields and `tests/routing_tests.rs`'s `test_circuit_breaker_*` tests for the state machine's exact behavior.
+
 ### Stage 4: Capability Matching
 The request's requirements are dynamically checked against candidate capabilities:
 

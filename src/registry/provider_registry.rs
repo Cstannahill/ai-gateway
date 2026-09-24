@@ -1,10 +1,29 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
 use crate::providers::Provider;
 use crate::types::{ProviderConfig, ProviderHealth, ProviderStatus};
+
+/// Per-provider circuit breaker state. See `ProviderRegistry::is_circuit_open`
+/// and `record_request_end` for the transition logic
+/// (docs/REMEDIATION_PLAN.md Phase 5 circuit breaker work).
+#[derive(Debug, Clone, Copy)]
+enum CircuitState {
+    /// Normal operation — requests flow through.
+    Closed,
+    /// Tripped after `circuit_breaker_threshold` consecutive failures;
+    /// routing skips this provider until `opened_at.elapsed()` exceeds the
+    /// configured cooldown.
+    Open { opened_at: Instant },
+    /// Cooldown elapsed — one (or more, since this gateway doesn't
+    /// serialize concurrent requests through a single trial slot) request
+    /// is allowed through to test recovery. A failure here re-opens the
+    /// circuit with a fresh cooldown; a success closes it.
+    HalfOpen,
+}
 
 // ─── Provider Registry ───────────────────────────────────────────────────────
 //
@@ -33,6 +52,8 @@ struct ProviderRuntimeState {
     /// `record_health_check_latency`'s doc comment.
     total_health_check_latency_ms: u64,
     health_check_latency_samples: u64,
+    circuit_state: CircuitState,
+    consecutive_failures: u32,
 }
 
 impl Default for ProviderRegistry {
@@ -68,6 +89,8 @@ impl ProviderRegistry {
                 latency_samples: 0,
                 total_health_check_latency_ms: 0,
                 health_check_latency_samples: 0,
+                circuit_state: CircuitState::Closed,
+                consecutive_failures: 0,
             },
         );
         self.providers.insert(name, adapter);
@@ -117,6 +140,37 @@ impl ProviderRegistry {
             .unwrap_or(false)
     }
 
+    /// Check whether a provider's circuit breaker is currently open (i.e.
+    /// routing should skip it). Disabled entirely (`false`) when
+    /// `circuit_breaker_threshold` isn't configured for this provider.
+    ///
+    /// This is the one circuit-breaker query that mutates state: an `Open`
+    /// circuit whose cooldown has elapsed transitions to `HalfOpen` here
+    /// (returning `false`, letting the trial request through) rather than
+    /// on a separate timer, so the transition only ever happens in response
+    /// to an actual routing check — there's nothing to drive it otherwise
+    /// in a single-user gateway that may sit idle between requests.
+    pub fn is_circuit_open(&self, name: &str) -> bool {
+        let Some(mut state) = self.state.get_mut(name) else {
+            return false;
+        };
+        let Some(_threshold) = state.config.circuit_breaker_threshold else {
+            return false;
+        };
+        match state.circuit_state {
+            CircuitState::Closed | CircuitState::HalfOpen => false,
+            CircuitState::Open { opened_at } => {
+                let cooldown = Duration::from_secs(state.config.circuit_breaker_cooldown_secs);
+                if opened_at.elapsed() >= cooldown {
+                    state.circuit_state = CircuitState::HalfOpen;
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
     /// Check if a provider is registered and administratively enabled,
     /// ignoring health status.
     ///
@@ -157,12 +211,31 @@ impl ProviderRegistry {
         }
     }
 
-    /// Record a request completing.
+    /// Record a request completing. Also drives the circuit breaker: a
+    /// success resets the consecutive-failure count and closes an
+    /// open/half-open circuit (recovery confirmed); a failure increments the
+    /// count and, once it reaches `circuit_breaker_threshold` (if
+    /// configured), opens the circuit with a fresh cooldown — including
+    /// re-opening immediately if the failing request was itself the
+    /// half-open trial.
     pub fn record_request_end(&self, name: &str, is_error: bool) {
         if let Some(mut state) = self.state.get_mut(name) {
             state.active_requests = state.active_requests.saturating_sub(1);
             if is_error {
                 state.total_errors += 1;
+                state.consecutive_failures += 1;
+                if let Some(threshold) = state.config.circuit_breaker_threshold
+                    && state.consecutive_failures >= threshold
+                {
+                    state.circuit_state = CircuitState::Open {
+                        opened_at: Instant::now(),
+                    };
+                }
+            } else {
+                state.consecutive_failures = 0;
+                if !matches!(state.circuit_state, CircuitState::Closed) {
+                    state.circuit_state = CircuitState::Closed;
+                }
             }
         }
     }
@@ -217,6 +290,12 @@ impl ProviderRegistry {
                     total_errors: s.total_errors,
                     avg_latency_ms: avg_latency,
                     avg_health_check_latency_ms: avg_health_check_latency,
+                    circuit_state: match s.circuit_state {
+                        CircuitState::Closed => "closed",
+                        CircuitState::Open { .. } => "open",
+                        CircuitState::HalfOpen => "half_open",
+                    }
+                    .to_string(),
                 }
             })
             .collect()

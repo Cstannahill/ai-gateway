@@ -60,6 +60,8 @@ fn create_provider_config(name: &str, enabled: bool) -> ProviderConfig {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+        circuit_breaker_threshold: None,
+        circuit_breaker_cooldown_secs: 30,
         enabled,
     }
 }
@@ -621,4 +623,242 @@ async fn test_unimplemented_policy_override_fails_loudly() {
     let result = router.route(&req, &model_registry, &provider_registry);
     assert!(result.is_err(), "expected an error for an unimplemented policy override");
     assert!(result.unwrap_err().to_string().contains("cheapest"));
+}
+
+fn model_with_single_candidate(provider: &str) -> HashMap<String, ModelDefinition> {
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![ModelCandidate {
+                provider: provider.to_string(),
+                model: "m1".to_string(),
+                priority: 5,
+                capabilities: None,
+                max_context_length: None,
+            }],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+    models
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_opens_after_consecutive_failures() {
+    // A provider with `circuit_breaker_threshold` configured must be
+    // skipped by routing (rejection reason `provider_circuit_open`) once it
+    // has failed that many times in a row, and must stay open until the
+    // cooldown elapses (docs/REMEDIATION_PLAN.md Phase 5 circuit breaker
+    // work).
+    let model_registry = ModelRegistry::new(model_with_single_candidate("flaky"));
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut flaky_config = create_provider_config("flaky", true);
+    flaky_config.circuit_breaker_threshold = Some(2);
+    flaky_config.circuit_breaker_cooldown_secs = 300;
+    provider_registry.register(
+        flaky_config,
+        Arc::new(MockProvider {
+            name: "flaky".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    // One failure isn't enough to trip a threshold of 2.
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", true);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "one failure must not open the circuit yet");
+
+    // Second consecutive failure trips it, and it stays open (cooldown is
+    // 5 minutes, far longer than this test takes to run).
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", true);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty(), "expected the circuit to be open after 2 consecutive failures");
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "flaky" && r.reason == "provider_circuit_open"),
+        "expected provider_circuit_open rejection, got: {:?}",
+        plan.decision.rejection_reasons
+    );
+
+    // Still open on a second check — nothing implicitly resets it early.
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty(), "expected the circuit to remain open before cooldown elapses");
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_trial_recovers_the_circuit() {
+    // With a zero-second cooldown, the very next routing check after the
+    // circuit opens has already "elapsed" past cooldown, so the half-open
+    // transition and its recovery are observable without sleeping in the
+    // test.
+    let model_registry = ModelRegistry::new(model_with_single_candidate("flaky"));
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut flaky_config = create_provider_config("flaky", true);
+    flaky_config.circuit_breaker_threshold = Some(1);
+    flaky_config.circuit_breaker_cooldown_secs = 0;
+    provider_registry.register(
+        flaky_config,
+        Arc::new(MockProvider {
+            name: "flaky".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    // Trip the circuit.
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", true);
+
+    // The next routing check transitions Open -> HalfOpen (cooldown is
+    // zero) and lets a trial candidate through rather than rejecting it.
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(
+        plan.candidates.len(),
+        1,
+        "expected a half-open trial request to be allowed through once cooldown elapses"
+    );
+
+    // A successful trial closes the circuit and resets the failure count.
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", false);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "expected the circuit to stay closed after a successful trial");
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_failure_reopens_the_circuit() {
+    // A failing trial request must re-open the circuit with a fresh
+    // cooldown rather than closing it or leaving it perpetually half-open.
+    // Uses a real 1-second cooldown and a real sleep since the transition
+    // is driven by wall-clock elapsed time, not a mockable clock.
+    let model_registry = ModelRegistry::new(model_with_single_candidate("flaky"));
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut flaky_config = create_provider_config("flaky", true);
+    flaky_config.circuit_breaker_threshold = Some(1);
+    flaky_config.circuit_breaker_cooldown_secs = 1;
+    provider_registry.register(
+        flaky_config,
+        Arc::new(MockProvider {
+            name: "flaky".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    // Trip the circuit.
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", true);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty(), "expected the circuit to be open immediately after tripping");
+
+    // Wait out the 1-second cooldown, then let the half-open trial through
+    // and fail it.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "expected the half-open trial to be let through after cooldown");
+    provider_registry.record_request_start("flaky");
+    provider_registry.record_request_end("flaky", true);
+
+    // Immediately after the failed trial, the fresh cooldown has not
+    // elapsed yet, so the circuit must reject again rather than staying
+    // half-open or closing.
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(
+        plan.candidates.is_empty(),
+        "expected the failed trial to re-open the circuit with a fresh cooldown"
+    );
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_blocks_explicit_addressing_too() {
+    // Same rationale as `max_concurrent`'s equivalent test: a tripped
+    // circuit is a reliability protection, not a routing preference, and
+    // must not be bypassable via explicit `provider/model` addressing.
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut config = create_provider_config("ollama", true);
+    config.circuit_breaker_threshold = Some(1);
+    config.circuit_breaker_cooldown_secs = 300;
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "ollama".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    provider_registry.record_request_start("ollama");
+    provider_registry.record_request_end("ollama", true);
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "ollama/llama3.1:8b".to_string(),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty());
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "ollama" && r.reason == "provider_circuit_open"),
+        "expected explicit addressing to also be blocked by provider_circuit_open, got: {:?}",
+        plan.decision.rejection_reasons
+    );
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_disabled_by_default() {
+    // `circuit_breaker_threshold: None` (the default) must never open the
+    // circuit no matter how many consecutive failures occur — matches
+    // `max_concurrent`'s opt-in shape so existing configs see no behavior
+    // change.
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        create_provider_config("ollama", true),
+        Arc::new(MockProvider {
+            name: "ollama".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    for _ in 0..10 {
+        provider_registry.record_request_start("ollama");
+        provider_registry.record_request_end("ollama", true);
+    }
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "ollama/llama3.1:8b".to_string(),
+        ..Default::default()
+    };
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "circuit breaker must stay disabled with no threshold configured");
 }

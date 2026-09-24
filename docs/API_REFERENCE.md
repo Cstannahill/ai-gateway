@@ -309,6 +309,7 @@ Live gateway performance statistics, uptime, error rates, and average latencies.
       "total_errors": 4,
       "active_requests": 1,
       "avg_latency_ms": 142.5,
+      "circuit_state": "closed",
       "error_rate": 0.00035
     },
     {
@@ -320,6 +321,7 @@ Live gateway performance statistics, uptime, error rates, and average latencies.
       "total_errors": 8,
       "active_requests": 1,
       "avg_latency_ms": 680.2,
+      "circuit_state": "closed",
       "error_rate": 0.00266
     }
   ]
@@ -344,7 +346,8 @@ Returns the operational status, health, and current load for each registered pro
       "active_requests": 0,
       "total_requests": 11200,
       "total_errors": 4,
-      "avg_latency_ms": 142.5
+      "avg_latency_ms": 142.5,
+      "circuit_state": "closed"
     },
     {
       "name": "openrouter",
@@ -354,7 +357,8 @@ Returns the operational status, health, and current load for each registered pro
       "active_requests": 1,
       "total_requests": 3005,
       "total_errors": 8,
-      "avg_latency_ms": 680.2
+      "avg_latency_ms": 680.2,
+      "circuit_state": "closed"
     }
   ]
 }

@@ -15,6 +15,8 @@ fn test_openai_compatible_provider_options_injection() {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+                circuit_breaker_threshold: None,
+                circuit_breaker_cooldown_secs: 30,
         enabled: true,
     };
 
@@ -54,6 +56,8 @@ fn test_generic_openai_options_fallback() {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+                circuit_breaker_threshold: None,
+                circuit_breaker_cooldown_secs: 30,
         enabled: true,
     };
 
@@ -90,6 +94,8 @@ fn test_standard_parameters_preserved_with_options() {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+                circuit_breaker_threshold: None,
+                circuit_breaker_cooldown_secs: 30,
         enabled: true,
     };
 
@@ -137,6 +143,8 @@ fn test_previously_dropped_fields_are_forwarded() {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+                circuit_breaker_threshold: None,
+                circuit_breaker_cooldown_secs: 30,
         enabled: true,
     };
     let adapter = OpenAICompatibleAdapter::new(&config, ModelCapabilities::default()).unwrap();

@@ -66,6 +66,20 @@ providers:
     # a resource-protection constraint, not a routing preference). Unset
     # means no limit.
     # max_concurrent: 4
+    # Optional circuit breaker: after this many *consecutive* attempt
+    # failures (tracked by ProviderRegistry::record_request_end, reset on
+    # any success), routing filters this candidate out with rejection
+    # reason "provider_circuit_open" — again including explicit addressing,
+    # for the same resource-protection rationale as max_concurrent. Unset
+    # (the default) disables the breaker entirely; a flaky provider is then
+    # only ever skipped via the existing per-attempt fallback/retry logic,
+    # not pre-emptively across requests.
+    # circuit_breaker_threshold: 5
+    # Seconds the circuit stays open before letting one trial request
+    # through (half-open) to test recovery. A failed trial re-opens the
+    # circuit with a fresh cooldown; a successful one closes it. Only
+    # meaningful when circuit_breaker_threshold is set. Default: 30.
+    # circuit_breaker_cooldown_secs: 30
 
   openrouter:
     name: "openrouter"

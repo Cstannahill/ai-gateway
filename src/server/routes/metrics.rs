@@ -37,6 +37,7 @@ pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "active_requests": s.active_requests,
                 "avg_latency_ms": s.avg_latency_ms,
                 "avg_health_check_latency_ms": s.avg_health_check_latency_ms,
+                "circuit_state": s.circuit_state,
                 "error_rate": if s.total_requests > 0 {
                     s.total_errors as f64 / s.total_requests as f64
                 } else {

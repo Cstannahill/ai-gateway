@@ -165,6 +165,33 @@ impl Router {
                 });
             }
 
+            // A tripped circuit breaker is a reliability protection, same
+            // rationale as the `enabled`/capacity checks above: explicit
+            // addressing must not be able to hammer a provider the gateway
+            // has already determined is repeatedly failing
+            // (docs/REMEDIATION_PLAN.md Phase 5 circuit breaker work).
+            if provider_registry.is_circuit_open(explicit_provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: model_id.clone(),
+                        resolution_type: "explicit_provider".to_string(),
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: explicit_provider.clone(),
+                            model: model_id.clone(),
+                            reason: "provider_circuit_open".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_provider".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             let candidate = ModelCandidate {
                 provider: explicit_provider.clone(),
                 model: model_id.clone(),
@@ -247,6 +274,30 @@ impl Router {
                 });
             }
 
+            // See the identical rationale in Stage 1's circuit-breaker check
+            // above (docs/REMEDIATION_PLAN.md Phase 5 circuit breaker work).
+            if provider_registry.is_circuit_open(provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: request.model.clone(),
+                        resolution_type,
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason: "provider_circuit_open".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_model".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             return Ok(RoutingPlan {
                 decision: RoutingDecision {
                     timestamp,
@@ -288,6 +339,16 @@ impl Router {
                         provider: c.provider.clone(),
                         model: c.model.clone(),
                         reason: "provider_at_capacity".to_string(),
+                    });
+                    return false;
+                }
+                // See Stage 1's circuit-breaker check for rationale
+                // (docs/REMEDIATION_PLAN.md Phase 5 circuit breaker work).
+                if provider_registry.is_circuit_open(&c.provider) {
+                    rejection_reasons.push(RejectionRecord {
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        reason: "provider_circuit_open".to_string(),
                     });
                     return false;
                 }
