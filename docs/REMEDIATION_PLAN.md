@@ -1,5 +1,21 @@
 # Remediation Plan
 
+## Implementation status (updated 2026-09-24, session 16 — per-provider rate limiting, Phase 5 item 3)
+
+Adds the last piece of item 3 not yet covered by `max_concurrent` (Phase 5.3) or the circuit breaker (session 14): a requests-per-second limiter, distinct from both — it bounds *arrival rate*, not simultaneous in-flight requests or consecutive-failure history.
+
+**New opt-in `ProviderConfig.rate_limit_per_sec: Option<u32>`** (`None` disables it, same shape as every other resource-protection field added this phase). **`ProviderRegistry::is_rate_limited`** implements a fixed 1-second window per provider (`rate_limit_window: (Instant, u32)` in `ProviderRuntimeState`): admits up to the configured count per window, resets the window once a full second has elapsed since it last reset. Deliberately fixed rather than sliding/smoothed — documented tradeoff (up to ~2x the configured rate can be admitted across a window boundary), acceptable for protecting a local inference server from being flooded, the feature's actual motivating use case, not intended as a strict SLA-grade limiter.
+
+Wired into the same three routing checkpoints as `is_at_capacity`/`is_circuit_open` (`src/routing/mod.rs` Stages 1/2/3), rejecting with `"provider_rate_limited"`, and — like the other two — not bypassable by explicit `provider/model` addressing.
+
+Tests (`tests/routing_tests.rs`, no DB): `test_rate_limit_blocks_candidates_once_the_window_is_exhausted`, `test_rate_limit_resets_after_the_window_elapses` (real 1.1s sleep, since the transition is wall-clock driven — same pattern as the circuit breaker's half-open tests), `test_rate_limit_blocks_explicit_addressing_too`, `test_rate_limit_disabled_by_default`.
+
+`cargo test --all-targets --offline` is green: **102 passed, 0 ignored, 0 warnings** (up from 98 — 4 new tests). No migration needed.
+
+`docs/CONFIGURATION_GUIDE.md` and `docs/ROUTING_AND_POLICIES.md` updated.
+
+**Remaining Phase 5 scope**: OTLP export, prompt/semantic caching, provider health scoring beyond the current ping-based binary healthy/unhealthy, and the dataset/annotation workflows (item 6 — blocked on Phase 4.3's Python layer, out of scope here). Item 7 (learned/AI-driven routing) remains permanently excluded. With this session, item 3 in its entirety (circuit breakers, `max_concurrent`, and now rate limiting) is closed except for the health-scoring half.
+
 ## Implementation status (updated 2026-09-24, session 15 — real routing-policy selection logic, Phase 5 item 5)
 
 Implements the actual selection logic for the five `RoutingPolicy` enum variants (`src/routing/policy.rs`) that previously had no dispatch arm and failed loudly by design (session 14's `Router::route` `other` catch-all, Phase 1.5/Audit CL03). All deterministic — no learned/AI-driven component, consistent with the user's standing instruction.

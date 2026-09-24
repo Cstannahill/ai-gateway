@@ -80,6 +80,18 @@ providers:
     # circuit with a fresh cooldown; a successful one closes it. Only
     # meaningful when circuit_breaker_threshold is set. Default: 30.
     # circuit_breaker_cooldown_secs: 30
+    # Optional rate limiter: maximum new attempts admitted per rolling
+    # 1-second window. Distinct from max_concurrent — this bounds arrival
+    # rate, not simultaneous in-flight requests (useful for a local
+    # inference server that can only accept one request every N ms
+    # regardless of concurrency). Rejected with reason
+    # "provider_rate_limited", including for explicit `provider/model`
+    # addressing. Implemented as a fixed (not sliding) 1-second window, so
+    # up to ~2x the configured rate can be admitted across a window
+    # boundary — acceptable for protecting a local server from being
+    # flooded, not meant as a strict SLA-grade limiter. Unset means no
+    # limit.
+    # rate_limit_per_sec: 10
 
   openrouter:
     name: "openrouter"

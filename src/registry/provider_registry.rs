@@ -54,6 +54,9 @@ struct ProviderRuntimeState {
     health_check_latency_samples: u64,
     circuit_state: CircuitState,
     consecutive_failures: u32,
+    /// Fixed-window rate limiter state: the window's start time and how
+    /// many attempts have been admitted since. See `is_rate_limited`.
+    rate_limit_window: (Instant, u32),
 }
 
 impl Default for ProviderRegistry {
@@ -91,6 +94,7 @@ impl ProviderRegistry {
                 health_check_latency_samples: 0,
                 circuit_state: CircuitState::Closed,
                 consecutive_failures: 0,
+                rate_limit_window: (Instant::now(), 0),
             },
         );
         self.providers.insert(name, adapter);
@@ -138,6 +142,45 @@ impl ProviderRegistry {
                 None => false,
             })
             .unwrap_or(false)
+    }
+
+    /// Check whether a provider is at its configured `rate_limit_per_sec`
+    /// ceiling, admitting the attempt (incrementing the window's counter)
+    /// if not. Disabled entirely (`false`, never mutating) when
+    /// `rate_limit_per_sec` isn't configured.
+    ///
+    /// This mutates on every call, unlike `is_at_capacity` — rate limiting
+    /// is inherently about *admission*, not a passive concurrency
+    /// snapshot, so the check and the consumption of one slot in the
+    /// window are the same operation (matches `is_circuit_open`'s
+    /// check-and-transition pattern for the same reason).
+    ///
+    /// Fixed 1-second window, not a sliding/smoothed one: `window_start`
+    /// resets to `now` and the count to zero once a full second has
+    /// elapsed since it was last reset. This means up to `2x` the
+    /// configured limit can theoretically be admitted across a window
+    /// boundary (e.g. `limit` requests at 0.99s and another `limit` at
+    /// 1.01s) — acceptable for protecting a single local inference server
+    /// from being flooded, which is this feature's actual purpose, but
+    /// worth knowing if this is ever repurposed as a strict SLA-grade
+    /// limiter.
+    pub fn is_rate_limited(&self, name: &str) -> bool {
+        let Some(mut state) = self.state.get_mut(name) else {
+            return false;
+        };
+        let Some(limit) = state.config.rate_limit_per_sec else {
+            return false;
+        };
+        let (window_start, count) = state.rate_limit_window;
+        if window_start.elapsed() >= Duration::from_secs(1) {
+            state.rate_limit_window = (Instant::now(), 1);
+            return false;
+        }
+        if count >= limit {
+            return true;
+        }
+        state.rate_limit_window.1 += 1;
+        false
     }
 
     /// Check whether a provider's circuit breaker is currently open (i.e.

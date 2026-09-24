@@ -63,6 +63,19 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<u32>,
 
+    /// Maximum new attempts admitted per rolling 1-second window. Distinct
+    /// from `max_concurrent`: this bounds *arrival rate*, not simultaneous
+    /// in-flight requests — a provider can be well under its concurrency
+    /// ceiling and still be rate-limited if attempts arrive in too tight a
+    /// burst (e.g. a local llama.cpp/vllm server that only accepts a
+    /// request every N ms regardless of concurrency). `None` (the default)
+    /// disables the limiter entirely, matching `max_concurrent`'s opt-in
+    /// shape. Implemented as a fixed (not sliding) window for simplicity —
+    /// see `ProviderRegistry::is_rate_limited`'s doc comment for the
+    /// resulting boundary-burst tradeoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_sec: Option<u32>,
+
     /// Consecutive attempt failures (see `ProviderRegistry::record_request_end`)
     /// before the circuit opens and this provider is skipped by routing.
     /// `None` (the default) disables the breaker entirely — matches

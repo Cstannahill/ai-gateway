@@ -116,6 +116,8 @@ A third check, same shape: if the provider has a configured `circuit_breaker_thr
 
 Distinguish this from the per-attempt retry/fallback logic below: fallback reacts to a single request's outcome and moves to the next candidate *within that request*; the circuit breaker persists state *across requests*, so a provider that has been consistently failing is skipped pre-emptively on the very next request rather than being retried and only then falling back, every time. See `docs/CONFIGURATION_GUIDE.md` for the config fields and `tests/routing_tests.rs`'s `test_circuit_breaker_*` tests for the state machine's exact behavior.
 
+A fourth check, same shape again: if the provider has a configured `rate_limit_per_sec`, `ProviderRegistry::is_rate_limited` is consulted and a candidate whose provider has already admitted `rate_limit_per_sec` attempts within the current 1-second window is rejected with reason `"provider_rate_limited"` — also not bypassable by explicit addressing. This is a different axis from `max_concurrent`: concurrency bounds how many attempts are *simultaneously in flight*, the rate limit bounds how many new attempts *arrive* per second, so a provider can be well under its concurrency ceiling and still be rate-limited if attempts burst too tightly (relevant for a local inference server that serializes requests internally regardless of how many the gateway has open). The window is fixed, not sliding — `ProviderRegistry::is_rate_limited`'s doc comment spells out the resulting boundary-burst tradeoff.
+
 ### Stage 4: Capability Matching
 The request's requirements are dynamically checked against candidate capabilities:
 

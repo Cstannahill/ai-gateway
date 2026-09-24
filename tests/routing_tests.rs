@@ -60,6 +60,7 @@ fn create_provider_config(name: &str, enabled: bool) -> ProviderConfig {
         default_headers: None,
         timeout_secs: 30,
         max_concurrent: None,
+                rate_limit_per_sec: None,
         circuit_breaker_threshold: None,
         circuit_breaker_cooldown_secs: 30,
         enabled,
@@ -1180,4 +1181,137 @@ async fn test_balanced_policy_prefers_the_candidate_that_wins_every_dimension() 
         plan.candidates[0].provider, "best",
         "expected the candidate winning cost, latency, and quality to rank first despite worse priority"
     );
+}
+
+#[tokio::test]
+async fn test_rate_limit_blocks_candidates_once_the_window_is_exhausted() {
+    // `rate_limit_per_sec` bounds *arrival rate* within a provider, distinct
+    // from `max_concurrent`'s simultaneous-in-flight ceiling
+    // (docs/REMEDIATION_PLAN.md Phase 5 rate limiting work).
+    let model_registry = ModelRegistry::new(model_with_single_candidate("bursty"));
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut config = create_provider_config("bursty", true);
+    config.rate_limit_per_sec = Some(2);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "bursty".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    // First two requests within the window are admitted.
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "first request should be admitted");
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "second request should be admitted");
+
+    // Third request in the same window is rejected.
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty(), "third request in the same window must be rate-limited");
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "bursty" && r.reason == "provider_rate_limited"),
+        "expected provider_rate_limited rejection, got: {:?}",
+        plan.decision.rejection_reasons
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_resets_after_the_window_elapses() {
+    let model_registry = ModelRegistry::new(model_with_single_candidate("bursty"));
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut config = create_provider_config("bursty", true);
+    config.rate_limit_per_sec = Some(1);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "bursty".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty(), "expected the second request in the same window to be rate-limited");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1, "expected a new window to admit a request again");
+}
+
+#[tokio::test]
+async fn test_rate_limit_blocks_explicit_addressing_too() {
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut config = create_provider_config("ollama", true);
+    config.rate_limit_per_sec = Some(1);
+    provider_registry.register(
+        config,
+        Arc::new(MockProvider {
+            name: "ollama".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "ollama/llama3.1:8b".to_string(),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert!(plan.candidates.is_empty());
+    assert!(
+        plan.decision
+            .rejection_reasons
+            .iter()
+            .any(|r| r.provider == "ollama" && r.reason == "provider_rate_limited"),
+        "expected explicit addressing to also be blocked by provider_rate_limited, got: {:?}",
+        plan.decision.rejection_reasons
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_disabled_by_default() {
+    let model_registry = ModelRegistry::new(HashMap::new());
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        create_provider_config("ollama", true),
+        Arc::new(MockProvider {
+            name: "ollama".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "ollama/llama3.1:8b".to_string(),
+        ..Default::default()
+    };
+
+    for _ in 0..20 {
+        let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+        assert_eq!(plan.candidates.len(), 1, "rate limiter must stay disabled with no rate_limit_per_sec configured");
+    }
 }

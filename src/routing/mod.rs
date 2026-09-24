@@ -207,6 +207,31 @@ impl Router {
                 });
             }
 
+            // A configured `rate_limit_per_sec` bounds arrival rate, same
+            // resource-protection rationale as the other two checks above
+            // (docs/REMEDIATION_PLAN.md Phase 5 rate limiting work).
+            if provider_registry.is_rate_limited(explicit_provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: model_id.clone(),
+                        resolution_type: "explicit_provider".to_string(),
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: explicit_provider.clone(),
+                            model: model_id.clone(),
+                            reason: "provider_rate_limited".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_provider".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             let candidate = ModelCandidate {
                 provider: explicit_provider.clone(),
                 model: model_id.clone(),
@@ -314,6 +339,30 @@ impl Router {
                 });
             }
 
+            // See the identical rationale in Stage 1's rate-limit check
+            // above (docs/REMEDIATION_PLAN.md Phase 5 rate limiting work).
+            if provider_registry.is_rate_limited(provider) {
+                return Ok(RoutingPlan {
+                    decision: RoutingDecision {
+                        timestamp,
+                        requested_model: request.model.clone(),
+                        resolution_type,
+                        candidates_considered: 1,
+                        candidates_rejected: 1,
+                        rejection_reasons: vec![RejectionRecord {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason: "provider_rate_limited".to_string(),
+                        }],
+                        selected_provider: String::new(),
+                        selected_model: String::new(),
+                        policy_applied: "short_circuit".to_string(),
+                        short_circuit: Some("explicit_model".to_string()),
+                    },
+                    candidates: vec![],
+                });
+            }
+
             return Ok(RoutingPlan {
                 decision: RoutingDecision {
                     timestamp,
@@ -365,6 +414,16 @@ impl Router {
                         provider: c.provider.clone(),
                         model: c.model.clone(),
                         reason: "provider_circuit_open".to_string(),
+                    });
+                    return false;
+                }
+                // See Stage 1's rate-limit check for rationale
+                // (docs/REMEDIATION_PLAN.md Phase 5 rate limiting work).
+                if provider_registry.is_rate_limited(&c.provider) {
+                    rejection_reasons.push(RejectionRecord {
+                        provider: c.provider.clone(),
+                        model: c.model.clone(),
+                        reason: "provider_rate_limited".to_string(),
                     });
                     return false;
                 }
