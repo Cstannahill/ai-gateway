@@ -120,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ─── Initialize routing engine ───────────────────────────────────────
-    let router = RoutingEngine::new(config.routing.default_policy.clone());
+    let router = RoutingEngine::new(config.routing.default_policy.clone())
+        .with_pricing(config.pricing.clone());
 
     // ─── Initialize the analytics read-pool ──────────────────────────────
     // A small, separate pool from the telemetry writer's own — analytics

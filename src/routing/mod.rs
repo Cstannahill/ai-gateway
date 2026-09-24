@@ -78,14 +78,29 @@ pub struct RejectionRecord {
 pub struct Router {
     default_policy: String,
     round_robin_counters: dashmap::DashMap<String, std::sync::atomic::AtomicUsize>,
+    /// Per-deployment pricing (`"provider/model"` → rate), used by the
+    /// `cheapest`/`balanced` policies. Empty by default — set via
+    /// `with_pricing` rather than a constructor parameter so the many
+    /// existing `Router::new` call sites across tests (which never
+    /// exercise cost-based routing) are unaffected.
+    pricing: std::collections::HashMap<String, crate::config::PricingEntry>,
 }
 
 impl Router {
     pub fn new(default_policy: String) -> Self {
-        Self { 
+        Self {
             default_policy,
             round_robin_counters: dashmap::DashMap::new(),
+            pricing: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach pricing data for the `cheapest`/`balanced` policies. A
+    /// deployment with no entry here is simply excluded from cost-based
+    /// ranking rather than assumed free — see `estimated_cost_usd`.
+    pub fn with_pricing(mut self, pricing: std::collections::HashMap<String, crate::config::PricingEntry>) -> Self {
+        self.pricing = pricing;
+        self
     }
 
     /// Route a request to an ordered list of provider/model candidates.
@@ -198,6 +213,7 @@ impl Router {
                 priority: 0,
                 capabilities: None,
                 max_context_length: None,
+                quality_tier: None,
             };
 
             return Ok(RoutingPlan {
@@ -427,13 +443,17 @@ impl Router {
         let mut candidates = compatible;
 
         match policy.as_str() {
-            "lowest_latency" => {
+            // "fastest" is a real `RoutingPolicy` variant kept distinct
+            // from "lowest_latency" in the enum for naming-preference
+            // reasons only (docs/routing/policy.rs) — both mean the exact
+            // same thing here.
+            "lowest_latency" | "fastest" => {
                 let statuses = provider_registry.all_statuses();
                 let latency_map: std::collections::HashMap<String, f64> = statuses
                     .into_iter()
                     .filter_map(|s| s.avg_latency_ms.map(|l| (s.name, l)))
                     .collect();
-                
+
                 candidates.sort_by(|a, b| {
                     a.priority.cmp(&b.priority).then_with(|| {
                         let lat_a = latency_map.get(&a.provider).copied().unwrap_or(f64::MAX);
@@ -441,6 +461,104 @@ impl Router {
                         lat_a.partial_cmp(&lat_b).unwrap_or(std::cmp::Ordering::Equal)
                     })
                 });
+            }
+            "local_first" => {
+                // Real signal (the candidate's own configured `base_url`
+                // host), not a guess by provider type — see
+                // `ProviderConfig::is_local`'s doc comment.
+                candidates.sort_by(|a, b| {
+                    let local_a = !provider_registry.is_local(&a.provider);
+                    let local_b = !provider_registry.is_local(&b.provider);
+                    local_a.cmp(&local_b).then_with(|| a.priority.cmp(&b.priority))
+                });
+            }
+            "cheapest" => {
+                // Unpriced candidates (no `pricing` entry) sort after every
+                // priced one — see `estimated_cost_usd`'s doc comment for
+                // why "no data" isn't treated as "free".
+                candidates.sort_by(|a, b| {
+                    let cost_a = self.estimated_cost_usd(a, request).unwrap_or(f64::MAX);
+                    let cost_b = self.estimated_cost_usd(b, request).unwrap_or(f64::MAX);
+                    cost_a
+                        .partial_cmp(&cost_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.priority.cmp(&b.priority))
+                });
+            }
+            "highest_quality" => {
+                // Operator-declared `quality_tier` only — see
+                // `ModelCandidate::quality_tier`'s doc comment for why this
+                // gateway doesn't infer quality on its own. Undeclared
+                // sorts last, not first or randomly.
+                candidates.sort_by(|a, b| {
+                    let q_a = a.quality_tier.unwrap_or(u32::MAX);
+                    let q_b = b.quality_tier.unwrap_or(u32::MAX);
+                    q_a.cmp(&q_b).then_with(|| a.priority.cmp(&b.priority))
+                });
+            }
+            "balanced" => {
+                // Combines cost, latency, and quality via Borda-style rank
+                // summing rather than a weighted formula with arbitrary
+                // normalization constants: each candidate's *position* if
+                // the full set were sorted independently by each dimension
+                // becomes that dimension's rank (0 = best), and the three
+                // ranks are summed. A candidate missing data for a
+                // dimension (no pricing entry, no latency samples yet, no
+                // declared quality_tier) is sorted last on that dimension
+                // and so gets the worst rank for it, rather than being
+                // excluded or assumed average — same "don't fabricate" rule
+                // as the single-dimension policies above. Lowest total rank
+                // wins; `priority` breaks remaining ties.
+                let statuses = provider_registry.all_statuses();
+                let latency_map: std::collections::HashMap<String, f64> = statuses
+                    .into_iter()
+                    .filter_map(|s| s.avg_latency_ms.map(|l| (s.name, l)))
+                    .collect();
+
+                let costs: Vec<f64> = candidates
+                    .iter()
+                    .map(|c| self.estimated_cost_usd(c, request).unwrap_or(f64::MAX))
+                    .collect();
+                let latencies: Vec<f64> = candidates
+                    .iter()
+                    .map(|c| latency_map.get(&c.provider).copied().unwrap_or(f64::MAX))
+                    .collect();
+                let qualities: Vec<u32> = candidates
+                    .iter()
+                    .map(|c| c.quality_tier.unwrap_or(u32::MAX))
+                    .collect();
+
+                // `ranks_of(values)[i]` = how many candidates have a
+                // strictly lower value than candidate `i` (0 = best on that
+                // dimension); ties get equal ranks rather than an arbitrary
+                // ordering.
+                fn ranks_of_f64(values: &[f64]) -> Vec<usize> {
+                    values
+                        .iter()
+                        .map(|v| values.iter().filter(|other| *other < v).count())
+                        .collect()
+                }
+                fn ranks_of_u32(values: &[u32]) -> Vec<usize> {
+                    values
+                        .iter()
+                        .map(|v| values.iter().filter(|other| *other < v).count())
+                        .collect()
+                }
+
+                let cost_ranks = ranks_of_f64(&costs);
+                let latency_ranks = ranks_of_f64(&latencies);
+                let quality_ranks = ranks_of_u32(&qualities);
+                let total_scores: Vec<usize> = (0..candidates.len())
+                    .map(|i| cost_ranks[i] + latency_ranks[i] + quality_ranks[i])
+                    .collect();
+
+                let mut indexed: Vec<usize> = (0..candidates.len()).collect();
+                indexed.sort_by(|&i, &j| {
+                    total_scores[i]
+                        .cmp(&total_scores[j])
+                        .then_with(|| candidates[i].priority.cmp(&candidates[j].priority))
+                });
+                candidates = indexed.into_iter().map(|i| candidates[i].clone()).collect();
             }
             "round_robin" => {
                 let counter = self.round_robin_counters
@@ -476,20 +594,15 @@ impl Router {
                 candidates.sort_by_key(|c| c.priority);
             }
             other => {
-                // `GatewayConfig::validate()` only checks that this is one
-                // of the *recognized* policy names, not that it's
-                // implemented — `local_first`/`cheapest`/`fastest`/
-                // `highest_quality`/`balanced` are real `RoutingPolicy`
-                // enum variants with no real dispatch arm here. Previously
-                // any unrecognized-here name (including these) silently
-                // fell back to ordered routing, with no telemetry
-                // distinguishing "policy X requested" from "policy X
-                // applied" (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit
-                // CL03). Silent substitution was the actual defect; failing
-                // loudly here is correct even though it means these five
-                // policies remain unusable until implemented.
+                // Every `RoutingPolicy` enum variant (src/routing/policy.rs)
+                // now has a real dispatch arm above — this catches only a
+                // genuinely unrecognized name (e.g. a typo), which must
+                // fail loudly rather than silently substitute ordered
+                // routing with no telemetry distinguishing "policy X
+                // requested" from "policy X applied" (docs/REMEDIATION_PLAN.md
+                // Phase 1.5 / Audit CL03).
                 anyhow::bail!(
-                    "routing policy '{}' is a recognized name but is not yet implemented (only 'ordered', 'round_robin', and 'lowest_latency' have real dispatch logic)",
+                    "routing policy '{}' is not a recognized policy name (expected one of: ordered, priority, round_robin, lowest_latency, fastest, local_first, cheapest, highest_quality, balanced)",
                     other
                 );
             }
@@ -560,6 +673,20 @@ impl Router {
     /// obviously-oversized requests before wasting a provider round-trip.
     /// See docs/ROUTING_AND_POLICIES.md for the documented limitation.
     fn estimate_request_tokens(request: &GatewayRequest) -> u64 {
+        let prompt_tokens = Self::estimate_prompt_tokens(request);
+        let completion_budget = request
+            .max_completion_tokens
+            .or(request.max_tokens)
+            .unwrap_or(0);
+
+        prompt_tokens + completion_budget
+    }
+
+    /// Chars/4 heuristic over every text part of every message — the same
+    /// estimate `estimate_request_tokens` uses for context-length filtering,
+    /// factored out so `estimated_cost_usd` can combine it with a different
+    /// completion-length assumption (see that function's doc comment).
+    fn estimate_prompt_tokens(request: &GatewayRequest) -> u64 {
         use crate::types::request::{ContentPart, MessageContent};
 
         let prompt_chars: u64 = request
@@ -583,13 +710,41 @@ impl Router {
             })
             .unwrap_or(0);
 
-        let prompt_tokens = prompt_chars / 4;
-        let completion_budget = request
+        prompt_chars / 4
+    }
+
+    /// Assumed completion length (tokens) for cost *ranking* purposes when
+    /// the request doesn't bound its own output — deliberately distinct
+    /// from `estimate_request_tokens`'s `unwrap_or(0)` for context-length
+    /// checking, where assuming a nonzero completion could wrongly reject a
+    /// candidate that would have fit. For ranking candidates against each
+    /// other, using 0 here would make every unbounded request look free and
+    /// defeat the point of `cheapest`, so a fixed assumption is used
+    /// instead — applied identically to every candidate, so it only
+    /// affects the *comparison*, not any billed/reported figure (matches
+    /// `docs/API_REFERENCE.md`'s `/v1/analytics/costs` framing of estimated
+    /// charges as estimates, never billed cost).
+    const ASSUMED_COMPLETION_TOKENS_FOR_RANKING: u64 = 256;
+
+    /// Estimated USD cost of running `request` on `candidate`, using the
+    /// configured `pricing` table. Returns `None` when no pricing entry
+    /// exists for this exact `provider/model` deployment — an unpriced
+    /// candidate is excluded from cost comparison rather than assumed free
+    /// (same "don't fabricate a number" rule `cost_summary` already
+    /// follows for `unpriced_attempts`).
+    fn estimated_cost_usd(&self, candidate: &ModelCandidate, request: &GatewayRequest) -> Option<f64> {
+        let key = format!("{}/{}", candidate.provider, candidate.model);
+        let entry = self.pricing.get(&key)?;
+        let prompt_tokens = Self::estimate_prompt_tokens(request);
+        let completion_tokens = request
             .max_completion_tokens
             .or(request.max_tokens)
-            .unwrap_or(0);
+            .unwrap_or(Self::ASSUMED_COMPLETION_TOKENS_FOR_RANKING);
 
-        prompt_tokens + completion_budget
+        Some(
+            (prompt_tokens as f64 / 1000.0) * entry.input_cost_per_1k
+                + (completion_tokens as f64 / 1000.0) * entry.output_cost_per_1k,
+        )
     }
 
     /// Check if the request contains vision/image content.

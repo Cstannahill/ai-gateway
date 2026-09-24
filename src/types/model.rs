@@ -42,6 +42,18 @@ pub struct ModelCandidate {
     /// Maximum context length for this deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_length: Option<u64>,
+
+    /// Operator-declared quality rank for the `highest_quality`/`balanced`
+    /// routing policies — lower is better (same convention as `priority`).
+    /// There is no benchmark or eval data anywhere in this gateway to
+    /// derive quality from automatically, so unlike `cheapest` (real
+    /// pricing data) or `local_first` (real `base_url` data), this is
+    /// explicit operator input, not gateway-inferred — the only honest way
+    /// to implement "highest quality" without fabricating a score. Left
+    /// unset, a candidate sorts last under these policies rather than being
+    /// assumed best or worst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_tier: Option<u32>,
 }
 
 fn default_priority() -> u32 {

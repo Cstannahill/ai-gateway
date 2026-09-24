@@ -171,6 +171,14 @@ impl ProviderRegistry {
         }
     }
 
+    /// Whether a provider's configured `base_url` is local (loopback or
+    /// private-network) — backs the `local_first` routing policy. `false`
+    /// for an unregistered provider (never preferred by a policy that
+    /// couldn't route to it anyway).
+    pub fn is_local(&self, name: &str) -> bool {
+        self.state.get(name).map(|s| s.config.is_local()).unwrap_or(false)
+    }
+
     /// Check if a provider is registered and administratively enabled,
     /// ignoring health status.
     ///

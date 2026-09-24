@@ -1,5 +1,25 @@
 # Remediation Plan
 
+## Implementation status (updated 2026-09-24, session 15 — real routing-policy selection logic, Phase 5 item 5)
+
+Implements the actual selection logic for the five `RoutingPolicy` enum variants (`src/routing/policy.rs`) that previously had no dispatch arm and failed loudly by design (session 14's `Router::route` `other` catch-all, Phase 1.5/Audit CL03). All deterministic — no learned/AI-driven component, consistent with the user's standing instruction.
+
+- **`local_first`**: real signal — `ProviderConfig::is_local` parses `base_url`'s host and checks loopback/private/link-local, not a guess by `r#type` (a `open_ai_compatible`-typed self-hosted vLLM on the LAN is still "local").
+- **`cheapest`**: real signal — reuses the existing `config.pricing` map (`"provider/model"` → per-1k rates, already powering `/v1/analytics/costs`) plus the existing chars/4 prompt estimate; completion tokens use the request's own bound or a fixed 256-token assumption applied identically to every candidate (affects only the *comparison*, never a reported figure). An unpriced candidate sorts last, never first — "no data" isn't "free." `Router` gained a `with_pricing` builder (not a new constructor param, to avoid touching the ~30 existing `Router::new`/`RoutingEngine::new` call sites across tests) — only `main.rs` calls it.
+- **`highest_quality`**: no benchmark/eval data exists anywhere in this gateway to derive quality automatically, so implementing this honestly meant adding one new field, `ModelCandidate.quality_tier: Option<u32>` (operator-declared, lower = better, same convention as `priority`) — explicit config input, never gateway-inferred. Undeclared sorts last.
+- **`balanced`**: combines all three signals above via Borda-style rank summing (each candidate ranked 0..N-1 independently per dimension, ranks summed, lowest total wins) rather than a weighted formula with arbitrary normalization constants.
+- **`fastest`**: literal alias for `lowest_latency` (the enum keeps them separate only for naming preference, per its own doc comment).
+
+`IMPLEMENTED_ROUTING_POLICIES` (`src/config/mod.rs`) now includes all 9 recognized names; the "recognized but unimplemented" tier this project has carried since Phase 1.5 no longer exists for any named policy — a rejected policy string is now unambiguously a typo.
+
+Tests (`tests/routing_tests.rs`, no DB): `test_cheapest_policy_prefers_lower_estimated_cost_and_deprioritizes_unpriced`, `test_local_first_policy_prefers_loopback_providers`, `test_highest_quality_policy_prefers_lower_quality_tier_and_deprioritizes_undeclared`, `test_balanced_policy_prefers_the_candidate_that_wins_every_dimension` (a candidate deliberately winning all three dimensions must rank first regardless of priority). `test_unimplemented_policy_override_fails_loudly` (which asserted `"cheapest"` failed) is renamed `test_unrecognized_policy_override_fails_loudly` and now asserts a genuine typo fails instead, since its original premise no longer holds. `tests/config_validation_tests.rs`'s `recognized_but_unimplemented_policies_are_rejected_as_default` is folded into `implemented_routing_policies_are_accepted_as_default` for the same reason.
+
+`cargo test --all-targets --offline` is green: **98 passed, 0 ignored, 0 warnings** (up from 95 — 4 new tests in `routing_tests.rs`, one renamed in place, minus 1 in `config_validation_tests.rs` from the merge). No migration needed.
+
+`docs/ROUTING_AND_POLICIES.md` (full Stage 5 policy table), `docs/CONFIGURATION_GUIDE.md` (`quality_tier` field, `default_policy`'s full accepted-value list) updated.
+
+**Remaining Phase 5 scope**: OTLP export, prompt/semantic caching, rate limiting (the `max_concurrent`/circuit-breaker pair already covers *concurrency* protection; a requests-per-second limiter is a distinct, still-open piece of item 3), provider health scoring beyond the current ping-based binary healthy/unhealthy, and the dataset/annotation workflows (item 6 — blocked on Phase 4.3's Python layer, which is out of scope here). Item 7 (learned/AI-driven routing) remains permanently excluded.
+
 ## Implementation status (updated 2026-09-24, session 14 — per-provider circuit breaker, Phase 5)
 
 With `docs/frontend/API_GAPS.md` fully closed (session 13) and the dashboard now owned by a separate agent, this session picked up the next well-scoped, no-schema-change piece of Phase 5: a per-provider circuit breaker, alongside the existing `max_concurrent` enforcement (Phase 5.3) as the second resource-protection mechanism in the routing pipeline. Deliberately deterministic and config-driven — no learned/AI-driven routing, consistent with the user's standing instruction that such routing must never be pulled forward.

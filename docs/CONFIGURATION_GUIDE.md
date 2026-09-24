@@ -140,6 +140,13 @@ models:
         model: "qwen3.5-9b"
         priority: 1
         max_context_length: 32768
+        # Optional, used only by the "highest_quality"/"balanced" routing
+        # policies: an operator-declared quality rank, lower is better (same
+        # convention as `priority`). There's no benchmark/eval data in this
+        # gateway to derive this automatically — it's explicit input, not
+        # gateway-inferred. Left unset, this candidate sorts last under
+        # those two policies.
+        # quality_tier: 2
       # Candidate 2: Cloud OpenRouter fallback
       - provider: "openrouter"
         model: "qwen/qwen-2.5-coder-32b-instruct"
@@ -188,7 +195,11 @@ models:
 
 # ─── 4. Routing Engine & Policy ──────────────────────────────────────────────
 routing:
-  # Routing algorithm: "priority" (default), "round_robin", or "lowest_latency"
+  # Routing algorithm. One of: "priority"/"ordered" (default), "round_robin",
+  # "lowest_latency"/"fastest", "local_first", "cheapest", "highest_quality",
+  # "balanced". See docs/ROUTING_AND_POLICIES.md's Stage 5 table for exactly
+  # what each one ranks by. Can also be overridden per-request via
+  # `routing.policy` in the request body.
   default_policy: "priority"
 
   # Maximum attempts per candidate provider before falling back

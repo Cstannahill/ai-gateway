@@ -236,15 +236,26 @@ fn default_fallback_log_path() -> String {
 const KNOWN_FALLBACK_TRIGGERS: &[&str] =
     &["timeout", "rate_limit", "unavailable", "server_error", "content_filter"];
 
-/// Routing policy names with real dispatch logic in `Router::route`. A
-/// request-level `routing.policy` override naming a *recognized but
-/// unimplemented* policy (see `RoutingPolicy` in `src/routing/policy.rs`)
-/// fails that one request at routing time with a clear error
-/// (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit CL03) — but `default_policy`
-/// is checked at startup against this narrower, actually-implemented list,
-/// so a config that passes validation can never make *every* request fail.
-const IMPLEMENTED_ROUTING_POLICIES: &[&str] =
-    &["ordered", "priority", "round_robin", "lowest_latency"];
+/// Routing policy names with real dispatch logic in `Router::route`. Every
+/// `RoutingPolicy` enum variant (`src/routing/policy.rs`) has a dispatch arm
+/// as of docs/REMEDIATION_PLAN.md's Phase 5 routing-policy work, so this
+/// list and the enum are now in lockstep — a name outside this list is
+/// simply not a recognized policy at all (typo), and both `default_policy`
+/// (checked here at startup) and a per-request `routing.policy` override
+/// (checked in `Router::route` at request time) reject it with the same
+/// clear error rather than silently substituting ordered routing
+/// (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit CL03).
+const IMPLEMENTED_ROUTING_POLICIES: &[&str] = &[
+    "ordered",
+    "priority",
+    "round_robin",
+    "lowest_latency",
+    "fastest",
+    "local_first",
+    "cheapest",
+    "highest_quality",
+    "balanced",
+];
 
 impl GatewayConfig {
     /// Load configuration from a YAML file.

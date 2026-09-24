@@ -42,22 +42,23 @@ fn unknown_routing_policy_is_rejected() {
 
 #[test]
 fn implemented_routing_policies_are_accepted_as_default() {
-    for policy in ["ordered", "round_robin", "lowest_latency"] {
+    // Every `RoutingPolicy` enum variant (src/routing/policy.rs) now has a
+    // real dispatch arm in `Router::route` (docs/REMEDIATION_PLAN.md Phase 5
+    // routing-policy work) — there is no longer a "recognized but
+    // unimplemented" tier between this list and `unknown_routing_policy_is_rejected`'s
+    // genuinely-unrecognized-name case.
+    for policy in [
+        "ordered",
+        "round_robin",
+        "lowest_latency",
+        "fastest",
+        "local_first",
+        "cheapest",
+        "highest_quality",
+        "balanced",
+    ] {
         let yaml = format!("routing:\n  default_policy: {policy}\n");
         assert!(parse(&yaml).is_ok(), "policy '{policy}' should be accepted");
-    }
-}
-
-#[test]
-fn recognized_but_unimplemented_policies_are_rejected_as_default() {
-    // These are real `RoutingPolicy` enum variants (src/routing/policy.rs)
-    // but have no dispatch arm in `Router::route` yet. Accepting them as
-    // `default_policy` would make every request fail at routing time
-    // instead of failing loudly once at startup (Audit CL03).
-    for policy in ["local_first", "cheapest", "fastest", "highest_quality", "balanced"] {
-        let yaml = format!("routing:\n  default_policy: {policy}\n");
-        let err = parse(&yaml).unwrap_err();
-        assert!(err.to_string().contains(policy), "{err}");
     }
 }
 

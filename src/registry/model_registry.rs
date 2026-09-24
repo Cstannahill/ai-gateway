@@ -51,6 +51,7 @@ impl ModelRegistry {
                 priority: 0,
                 capabilities: None,
                 max_context_length: None,
+                quality_tier: None,
             };
 
             return Ok(ResolvedModel {

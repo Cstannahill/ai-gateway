@@ -81,6 +81,7 @@ async fn test_alias_resolution_ordered_by_priority() {
                     priority: 20,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "ollama".to_string(),
@@ -88,6 +89,7 @@ async fn test_alias_resolution_ordered_by_priority() {
                     priority: 10,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities::default(),
@@ -206,6 +208,7 @@ async fn test_vision_filtering() {
                         ..Default::default()
                     }),
                     max_context_length: None,
+                quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "vision-provider".to_string(),
@@ -216,6 +219,7 @@ async fn test_vision_filtering() {
                         ..Default::default()
                     }),
                     max_context_length: None,
+                quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities {
@@ -298,6 +302,7 @@ async fn test_tool_filtering() {
                         ..Default::default()
                     }),
                     max_context_length: None,
+                quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "has-tools".to_string(),
@@ -308,6 +313,7 @@ async fn test_tool_filtering() {
                         ..Default::default()
                     }),
                     max_context_length: None,
+                quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities {
@@ -376,6 +382,7 @@ async fn test_disabled_provider_filtered() {
                     priority: 5,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "enabled-p".to_string(),
@@ -383,6 +390,7 @@ async fn test_disabled_provider_filtered() {
                     priority: 10,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities::default(),
@@ -438,6 +446,7 @@ async fn test_max_concurrent_filtering() {
                     priority: 5,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "roomy".to_string(),
@@ -445,6 +454,7 @@ async fn test_max_concurrent_filtering() {
                     priority: 10,
                     capabilities: None,
                     max_context_length: None,
+                quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities::default(),
@@ -516,6 +526,7 @@ async fn test_context_length_filtering() {
                     priority: 5,
                     capabilities: None,
                     max_context_length: Some(100),
+                    quality_tier: None,
                 },
                 ModelCandidate {
                     provider: "large-context".to_string(),
@@ -523,6 +534,7 @@ async fn test_context_length_filtering() {
                     priority: 10,
                     capabilities: None,
                     max_context_length: Some(1_000_000),
+                    quality_tier: None,
                 },
             ],
             capabilities: ModelCapabilities::default(),
@@ -577,11 +589,13 @@ async fn test_context_length_filtering() {
 }
 
 #[tokio::test]
-async fn test_unimplemented_policy_override_fails_loudly() {
-    // "cheapest" is a real `RoutingPolicy` enum variant with no dispatch
-    // arm in `Router::route` — a per-request override naming it must fail
-    // clearly rather than silently substitute ordered routing
-    // (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit CL03).
+async fn test_unrecognized_policy_override_fails_loudly() {
+    // Every real `RoutingPolicy` enum variant now has a dispatch arm
+    // (docs/REMEDIATION_PLAN.md Phase 5 routing-policy work), so this test
+    // now exercises a genuinely unrecognized name (a typo) rather than a
+    // recognized-but-unimplemented one — a per-request override naming it
+    // must still fail clearly rather than silently substitute ordered
+    // routing (docs/REMEDIATION_PLAN.md Phase 1.5 / Audit CL03).
     let mut models = HashMap::new();
     models.insert(
         "model-1".to_string(),
@@ -594,6 +608,7 @@ async fn test_unimplemented_policy_override_fails_loudly() {
                 priority: 1,
                 capabilities: None,
                 max_context_length: None,
+                quality_tier: None,
             }],
             capabilities: ModelCapabilities::default(),
         },
@@ -614,15 +629,15 @@ async fn test_unimplemented_policy_override_fails_loudly() {
         model: "model-1".to_string(),
         routing: Some(RoutingHints {
             provider: None,
-            policy: Some("cheapest".to_string()),
+            policy: Some("quantum_vibes".to_string()),
             candidates: None,
         }),
         ..Default::default()
     };
 
     let result = router.route(&req, &model_registry, &provider_registry);
-    assert!(result.is_err(), "expected an error for an unimplemented policy override");
-    assert!(result.unwrap_err().to_string().contains("cheapest"));
+    assert!(result.is_err(), "expected an error for an unrecognized policy override");
+    assert!(result.unwrap_err().to_string().contains("quantum_vibes"));
 }
 
 fn model_with_single_candidate(provider: &str) -> HashMap<String, ModelDefinition> {
@@ -638,6 +653,7 @@ fn model_with_single_candidate(provider: &str) -> HashMap<String, ModelDefinitio
                 priority: 5,
                 capabilities: None,
                 max_context_length: None,
+                quality_tier: None,
             }],
             capabilities: ModelCapabilities::default(),
         },
@@ -861,4 +877,307 @@ async fn test_circuit_breaker_disabled_by_default() {
     };
     let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
     assert_eq!(plan.candidates.len(), 1, "circuit breaker must stay disabled with no threshold configured");
+}
+
+#[tokio::test]
+async fn test_cheapest_policy_prefers_lower_estimated_cost_and_deprioritizes_unpriced() {
+    // "cheapest" must rank by real configured pricing, and a candidate with
+    // no pricing entry must sort after every priced one rather than being
+    // assumed free (docs/REMEDIATION_PLAN.md Phase 5 routing-policy work).
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![
+                ModelCandidate {
+                    provider: "pricey".to_string(),
+                    model: "big".to_string(),
+                    priority: 5,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+                ModelCandidate {
+                    provider: "cheap".to_string(),
+                    model: "small".to_string(),
+                    priority: 10,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+                ModelCandidate {
+                    provider: "unpriced".to_string(),
+                    model: "mystery".to_string(),
+                    priority: 1,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+            ],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+
+    let model_registry = ModelRegistry::new(models);
+    let mut provider_registry = ProviderRegistry::new();
+    for name in ["pricey", "cheap", "unpriced"] {
+        provider_registry.register(
+            create_provider_config(name, true),
+            Arc::new(MockProvider {
+                name: name.to_string(),
+                capabilities: ModelCapabilities::default(),
+            }),
+        );
+    }
+
+    let mut pricing = HashMap::new();
+    pricing.insert(
+        "pricey/big".to_string(),
+        ai_gateway::config::PricingEntry {
+            input_cost_per_1k: 10.0,
+            output_cost_per_1k: 30.0,
+        },
+    );
+    pricing.insert(
+        "cheap/small".to_string(),
+        ai_gateway::config::PricingEntry {
+            input_cost_per_1k: 0.1,
+            output_cost_per_1k: 0.2,
+        },
+    );
+
+    let router = Router::new("priority".to_string()).with_pricing(pricing);
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        routing: Some(RoutingHints {
+            provider: None,
+            policy: Some("cheapest".to_string()),
+            candidates: None,
+        }),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 3);
+    assert_eq!(plan.candidates[0].provider, "cheap");
+    assert_eq!(plan.candidates[1].provider, "pricey");
+    assert_eq!(plan.candidates[2].provider, "unpriced", "unpriced candidate must sort last, not first or free");
+}
+
+#[tokio::test]
+async fn test_local_first_policy_prefers_loopback_providers() {
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![
+                ModelCandidate {
+                    provider: "cloud".to_string(),
+                    model: "m1".to_string(),
+                    priority: 1,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+                ModelCandidate {
+                    provider: "local".to_string(),
+                    model: "m2".to_string(),
+                    priority: 20,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+            ],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+
+    let model_registry = ModelRegistry::new(models);
+    let mut provider_registry = ProviderRegistry::new();
+
+    let mut cloud_config = create_provider_config("cloud", true);
+    cloud_config.base_url = url::Url::parse("https://api.example.com/v1").unwrap();
+    provider_registry.register(
+        cloud_config,
+        Arc::new(MockProvider {
+            name: "cloud".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+    // create_provider_config already defaults to http://localhost:8080/v1.
+    provider_registry.register(
+        create_provider_config("local", true),
+        Arc::new(MockProvider {
+            name: "local".to_string(),
+            capabilities: ModelCapabilities::default(),
+        }),
+    );
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        routing: Some(RoutingHints {
+            provider: None,
+            policy: Some("local_first".to_string()),
+            candidates: None,
+        }),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 2);
+    assert_eq!(
+        plan.candidates[0].provider, "local",
+        "local_first must prefer the loopback provider even though its priority is worse"
+    );
+}
+
+#[tokio::test]
+async fn test_highest_quality_policy_prefers_lower_quality_tier_and_deprioritizes_undeclared() {
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![
+                ModelCandidate {
+                    provider: "flagship".to_string(),
+                    model: "m1".to_string(),
+                    priority: 20,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: Some(1),
+                },
+                ModelCandidate {
+                    provider: "budget".to_string(),
+                    model: "m2".to_string(),
+                    priority: 1,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: Some(5),
+                },
+                ModelCandidate {
+                    provider: "undeclared".to_string(),
+                    model: "m3".to_string(),
+                    priority: 2,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: None,
+                },
+            ],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+
+    let model_registry = ModelRegistry::new(models);
+    let mut provider_registry = ProviderRegistry::new();
+    for name in ["flagship", "budget", "undeclared"] {
+        provider_registry.register(
+            create_provider_config(name, true),
+            Arc::new(MockProvider {
+                name: name.to_string(),
+                capabilities: ModelCapabilities::default(),
+            }),
+        );
+    }
+
+    let router = Router::new("priority".to_string());
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        routing: Some(RoutingHints {
+            provider: None,
+            policy: Some("highest_quality".to_string()),
+            candidates: None,
+        }),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 3);
+    assert_eq!(plan.candidates[0].provider, "flagship", "lowest quality_tier value must be preferred");
+    assert_eq!(plan.candidates[1].provider, "budget");
+    assert_eq!(plan.candidates[2].provider, "undeclared", "undeclared quality_tier must sort last");
+}
+
+#[tokio::test]
+async fn test_balanced_policy_prefers_the_candidate_that_wins_every_dimension() {
+    // A deliberately clear-cut scenario: "best" wins on cost, latency, and
+    // quality_tier all three, so it must come out on top of the Borda-style
+    // rank sum regardless of how the three dimensions are weighted.
+    let mut models = HashMap::new();
+    models.insert(
+        "model-1".to_string(),
+        ModelDefinition {
+            name: "model-1".to_string(),
+            description: None,
+            candidates: vec![
+                ModelCandidate {
+                    provider: "worst".to_string(),
+                    model: "m1".to_string(),
+                    priority: 1,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: Some(9),
+                },
+                ModelCandidate {
+                    provider: "best".to_string(),
+                    model: "m2".to_string(),
+                    priority: 99,
+                    capabilities: None,
+                    max_context_length: None,
+                    quality_tier: Some(1),
+                },
+            ],
+            capabilities: ModelCapabilities::default(),
+        },
+    );
+
+    let model_registry = ModelRegistry::new(models);
+    let mut provider_registry = ProviderRegistry::new();
+    for name in ["worst", "best"] {
+        provider_registry.register(
+            create_provider_config(name, true),
+            Arc::new(MockProvider {
+                name: name.to_string(),
+                capabilities: ModelCapabilities::default(),
+            }),
+        );
+    }
+    // Give "best" better observed latency via a fast recorded attempt, and
+    // "worst" a slow one.
+    provider_registry.record_latency("best", 10);
+    provider_registry.record_latency("worst", 5000);
+
+    let mut pricing = HashMap::new();
+    pricing.insert(
+        "worst/m1".to_string(),
+        ai_gateway::config::PricingEntry { input_cost_per_1k: 50.0, output_cost_per_1k: 50.0 },
+    );
+    pricing.insert(
+        "best/m2".to_string(),
+        ai_gateway::config::PricingEntry { input_cost_per_1k: 0.01, output_cost_per_1k: 0.01 },
+    );
+
+    let router = Router::new("priority".to_string()).with_pricing(pricing);
+    let req = GatewayRequest {
+        model: "model-1".to_string(),
+        routing: Some(RoutingHints {
+            provider: None,
+            policy: Some("balanced".to_string()),
+            candidates: None,
+        }),
+        ..Default::default()
+    };
+
+    let plan = router.route(&req, &model_registry, &provider_registry).unwrap();
+    assert_eq!(plan.candidates.len(), 2);
+    assert_eq!(
+        plan.candidates[0].provider, "best",
+        "expected the candidate winning cost, latency, and quality to rank first despite worse priority"
+    );
 }

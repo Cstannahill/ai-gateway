@@ -85,6 +85,30 @@ fn default_circuit_breaker_cooldown_secs() -> u64 {
     30
 }
 
+impl ProviderConfig {
+    /// Whether this provider's `base_url` points at a loopback or
+    /// private-network address — used by the `local_first` routing policy.
+    /// Deliberately host-based rather than keyed off `r#type`: a generic
+    /// `open_ai_compatible` entry pointing at a self-hosted vLLM/llama.cpp
+    /// server on the LAN is just as "local" as a `llama_cpp`/`vllm`-typed
+    /// one, and the type alone can't tell them apart.
+    pub fn is_local(&self) -> bool {
+        let Some(host) = self.base_url.host_str() else {
+            return false;
+        };
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return match ip {
+                std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => v6.is_loopback(),
+            };
+        }
+        false
+    }
+}
+
 fn default_timeout() -> u64 {
     120
 }
