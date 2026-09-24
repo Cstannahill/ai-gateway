@@ -1,5 +1,20 @@
 # Remediation Plan
 
+## Implementation status (updated 2026-09-24, session 19 — OTLP export explicitly declined, Phase 5 wrap-up)
+
+Item 2 (OTLP export) was put to the user directly rather than built unprompted: OTLP is a *secondary, optional* export of already-persisted data as traces/spans for an external tool (Jaeger, Grafana Tempo, etc.) — it does not feed back into Postgres and Postgres doesn't depend on it. The user's question ("is this how we're planning to collect a lot of our data we'd be persisting?") surfaced a real ambiguity worth resolving before building anything: no — `TelemetryWriter` → PostgreSQL (Phases 0–3) is and remains the sole system of record; OTLP would only ever be a visualization layer on top of it. With that clarified, and no OTLP collector/backend anywhere in this deployment to receive it, the user chose to **decline it explicitly** rather than defer it vaguely — same precedent as session 13's auth decision for `docs/frontend/API_GAPS.md` item 8. Revisit only if a collector is actually stood up.
+
+**This closes out everything in Phase 5 that is actionable right now:**
+- Item 1 (durable outbox) — done, session 6.
+- Item 2 (OTLP export) — explicitly declined, this session, not merely deferred.
+- Item 3 (circuit breakers, health scoring, rate limiting, `max_concurrent`) — done in full, sessions 6/14/16/17.
+- Item 4 (caching) — exact-match done, session 18; semantic caching remains genuinely out of scope (needs an embedding call + similarity-threshold design, a materially different feature).
+- Item 5 (cost/local-first/quality/balanced/cheapest routing policies) — done in full, session 15.
+- Item 6 (dataset/annotation/SFT-DPO export workflows) — structurally blocked: needs Phase 4.3's Python analysis layer, which is out of scope for this backend work and not owned here.
+- Item 7 (learned/AI-driven routing) — permanently excluded per the user's standing instruction; never built, never will be.
+
+No further Phase 5 work is pending a decision. What's left (semantic caching, item 6) needs either a different kind of feature (embedding infra) or a different piece of the project (the Python layer) to exist first, not a green light on already-scoped work.
+
 ## Implementation status (updated 2026-09-24, session 18 — exact-match response caching, Phase 5 item 4 (partial))
 
 Implements the exact-match half of item 4 ("prompt/semantic caching"). Semantic caching (embedding-similarity matching for near-duplicate prompts) remains explicitly out of scope for this pass — it needs an embedding model call per request plus a similarity-threshold judgment call, a materially different and larger piece of work; see `docs/ROUTING_AND_POLICIES.md`'s new caching section for the honest scope statement.
