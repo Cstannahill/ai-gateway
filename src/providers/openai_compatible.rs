@@ -111,18 +111,24 @@ impl OpenAICompatibleAdapter {
     }
 
     /// Build common headers (Authorization, Content-Type, etc.).
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
+    ///
+    /// Returns an error rather than panicking if `api_key` contains bytes
+    /// that aren't a valid HTTP header value (e.g. a stray newline from a
+    /// copy-pasted key) — this runs on *every* request to this provider, so
+    /// a `.unwrap()` here would panic every single request until the
+    /// operator fixed their config, rather than failing that one request
+    /// with a clear message.
+    fn build_headers(&self) -> anyhow::Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
+            reqwest::header::HeaderValue::from_static("application/json"),
         );
 
         if let Some(ref key) = self.api_key {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", key).parse().unwrap(),
-            );
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", key))
+                .map_err(|e| anyhow::anyhow!("provider '{}' has an invalid api_key (not a valid HTTP header value): {e}", self.name))?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
         }
 
         for (k, v) in &self.default_headers {
@@ -134,7 +140,7 @@ impl OpenAICompatibleAdapter {
             }
         }
 
-        headers
+        Ok(headers)
     }
 
     /// Build the request body for a chat completion.
@@ -359,7 +365,7 @@ impl Provider for OpenAICompatibleAdapter {
 
     async fn models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = self.endpoint("/v1/models");
-        let headers = self.build_headers();
+        let headers = self.build_headers()?;
 
         let response = self
             .client
@@ -395,7 +401,15 @@ impl Provider for OpenAICompatibleAdapter {
     async fn health(&self) -> ProviderHealth {
         // Try to reach the models endpoint as a health check.
         let url = self.endpoint("/v1/models");
-        let headers = self.build_headers();
+        let headers = match self.build_headers() {
+            Ok(h) => h,
+            // A malformed api_key genuinely means this provider is
+            // misconfigured — Unhealthy is the correct signal, not a panic.
+            Err(e) => {
+                tracing::warn!(provider = %self.name, error = %e, "Health check failed: invalid headers");
+                return ProviderHealth::Unhealthy;
+            }
+        };
 
         match self.client.get(&url).headers(headers).send().await {
             Ok(resp) if resp.status().is_success() => ProviderHealth::Healthy,
@@ -413,7 +427,7 @@ impl Provider for OpenAICompatibleAdapter {
         let started = Utc::now();
         let body = self.build_chat_body(request, model);
         let url = self.endpoint("/v1/chat/completions");
-        let headers = self.build_headers();
+        let headers = self.build_headers()?;
 
         let provider_name = self.name.clone();
         let model_name = model.to_string();
@@ -663,7 +677,7 @@ impl Provider for OpenAICompatibleAdapter {
         input: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let url = self.endpoint("/v1/embeddings");
-        let headers = self.build_headers();
+        let headers = self.build_headers()?;
         let payload = serde_json::json!({
             "model": model,
             "input": input,
@@ -678,5 +692,57 @@ impl Provider for OpenAICompatibleAdapter {
 
         let res: serde_json::Value = resp.json().await?;
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ProviderConfig;
+
+    fn config_with_api_key(api_key: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            name: "test".to_string(),
+            r#type: crate::types::ProviderType::OpenAiCompatible,
+            base_url: url::Url::parse("http://127.0.0.1:1/v1").unwrap(),
+            api_key: api_key.map(str::to_string),
+            api_key_env: None,
+            default_headers: None,
+            timeout_secs: 30,
+            max_concurrent: None,
+            rate_limit_per_sec: None,
+            degraded_error_rate_threshold: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cooldown_secs: 30,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn build_headers_succeeds_with_a_normal_api_key() {
+        let adapter =
+            OpenAICompatibleAdapter::new(&config_with_api_key(Some("sk-normal-key")), ModelCapabilities::default())
+                .unwrap();
+        assert!(adapter.build_headers().is_ok());
+    }
+
+    #[test]
+    fn build_headers_returns_an_error_instead_of_panicking_on_a_malformed_api_key() {
+        // A stray newline (e.g. from a copy-pasted key with a trailing
+        // linebreak) is not a valid HTTP header value byte. This used to
+        // `.unwrap()` and panic on every single request to the provider
+        // until the operator fixed their config — now it's a clean error
+        // (docs/REMEDIATION_PLAN.md Phase 5 hardening pass).
+        let adapter =
+            OpenAICompatibleAdapter::new(&config_with_api_key(Some("sk-bad\nkey")), ModelCapabilities::default())
+                .unwrap();
+        let err = adapter.build_headers().unwrap_err();
+        assert!(err.to_string().contains("test"), "{err}");
+    }
+
+    #[test]
+    fn build_headers_succeeds_with_no_api_key() {
+        let adapter = OpenAICompatibleAdapter::new(&config_with_api_key(None), ModelCapabilities::default()).unwrap();
+        assert!(adapter.build_headers().is_ok());
     }
 }

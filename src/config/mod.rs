@@ -382,6 +382,40 @@ impl GatewayConfig {
             }
         }
 
+        for (name, provider) in &self.providers {
+            // `Some(0)` for either of these means "this provider can never
+            // serve a request" — always at capacity / always rate-limited
+            // from the very first attempt. Nobody sets this intentionally;
+            // it's a misconfiguration (meant to leave it unset for "no
+            // limit", or meant to write a real number) that would otherwise
+            // silently make the provider permanently unusable with no
+            // startup error, only a confusing stream of
+            // `provider_at_capacity`/`provider_rate_limited` rejections at
+            // request time (docs/REMEDIATION_PLAN.md Phase 5 hardening
+            // pass).
+            if provider.max_concurrent == Some(0) {
+                anyhow::bail!(
+                    "provider '{}' has max_concurrent: 0, which would make it permanently at capacity — omit the field for no limit, or set a positive value",
+                    name
+                );
+            }
+            if provider.rate_limit_per_sec == Some(0) {
+                anyhow::bail!(
+                    "provider '{}' has rate_limit_per_sec: 0, which would make it permanently rate-limited — omit the field for no limit, or set a positive value",
+                    name
+                );
+            }
+            if let Some(threshold) = provider.degraded_error_rate_threshold
+                && !(0.0..=1.0).contains(&threshold)
+            {
+                anyhow::bail!(
+                    "provider '{}' has degraded_error_rate_threshold: {} — must be between 0.0 and 1.0 (it's a fraction, e.g. 0.5 for 50%, not a percentage)",
+                    name,
+                    threshold
+                );
+            }
+        }
+
         Ok(())
     }
 

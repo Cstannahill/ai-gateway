@@ -80,10 +80,36 @@ impl ResponseCache {
 
     /// Insert a cache entry, evicting the oldest-inserted entry first if
     /// this would exceed `max_entries`.
+    ///
+    /// Determines "is this key new" via `DashMap::entry` rather than a
+    /// separate `contains_key` check followed by a separate `insert` —
+    /// under two concurrent inserts of the *same* key (a realistic case:
+    /// two in-flight requests for the same prompt racing to populate the
+    /// cache), a check-then-act pair could let both threads observe "not
+    /// present yet" and both push into `insertion_order`, double-counting
+    /// one logical entry and causing eviction to run too aggressively.
+    /// `entry()` holds that key's shard lock across the whole
+    /// check-and-write, so the second racing thread correctly observes the
+    /// first thread's write instead.
     pub fn insert(&self, key: String, response: CachedResponse) {
-        if !self.entries.contains_key(&key) {
+        let new_entry = CacheEntry {
+            response,
+            inserted_at: Instant::now(),
+        };
+        let is_new = match self.entries.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                e.insert(new_entry);
+                false
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(new_entry);
+                true
+            }
+        };
+
+        if is_new {
             let mut order = self.insertion_order.lock().unwrap_or_else(|e| e.into_inner());
-            order.push_back(key.clone());
+            order.push_back(key);
             while order.len() > self.max_entries {
                 if let Some(oldest) = order.pop_front() {
                     self.entries.remove(&oldest);
@@ -92,13 +118,6 @@ impl ResponseCache {
                 }
             }
         }
-        self.entries.insert(
-            key,
-            CacheEntry {
-                response,
-                inserted_at: Instant::now(),
-            },
-        );
     }
 
     pub fn hits(&self) -> u64 {
@@ -182,6 +201,24 @@ mod tests {
         assert!(cache.get("a").is_none(), "oldest-inserted entry must be evicted first");
         assert!(cache.get("b").is_some());
         assert!(cache.get("c").is_some());
+    }
+
+    #[test]
+    fn repeated_inserts_of_the_same_key_do_not_inflate_the_eviction_queue() {
+        // Re-inserting the same key (e.g. two racing requests for the same
+        // prompt both populating the cache) must not count as two entries
+        // toward max_entries and must not cause a live, distinct key to be
+        // evicted prematurely.
+        let cache = ResponseCache::new(Duration::from_secs(60), 2);
+        cache.insert("a".to_string(), dummy_response("a1"));
+        cache.insert("a".to_string(), dummy_response("a2"));
+        cache.insert("a".to_string(), dummy_response("a3"));
+        assert_eq!(cache.len(), 1, "re-inserting the same key must not grow the entry count");
+
+        cache.insert("b".to_string(), dummy_response("b"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("a").is_some(), "3 inserts of 'a' must count as 1 entry toward capacity, not 3");
+        assert_eq!(cache.get("a").unwrap().body, serde_json::json!({"tag": "a3"}), "the latest write must win");
     }
 
     #[test]

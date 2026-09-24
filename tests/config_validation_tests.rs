@@ -122,3 +122,64 @@ pricing:
 "#;
     assert!(parse(yaml).is_ok());
 }
+
+#[test]
+fn zero_max_concurrent_is_rejected() {
+    // Some(0) would make the provider permanently at capacity — a
+    // misconfiguration (meant "unset"), not a usable limit
+    // (docs/REMEDIATION_PLAN.md Phase 5 hardening pass).
+    let yaml = r#"
+providers:
+  llama:
+    name: llama
+    type: llama_cpp
+    base_url: "http://localhost:8080"
+    max_concurrent: 0
+"#;
+    let err = parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("llama"), "{err}");
+    assert!(err.to_string().contains("max_concurrent"), "{err}");
+}
+
+#[test]
+fn zero_rate_limit_is_rejected() {
+    let yaml = r#"
+providers:
+  llama:
+    name: llama
+    type: llama_cpp
+    base_url: "http://localhost:8080"
+    rate_limit_per_sec: 0
+"#;
+    let err = parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("llama"), "{err}");
+    assert!(err.to_string().contains("rate_limit_per_sec"), "{err}");
+}
+
+#[test]
+fn out_of_range_degraded_error_rate_threshold_is_rejected() {
+    // A value like 50 (meant as "50%") rather than 0.5 would silently never
+    // trigger, and a negative value would trigger constantly — both are
+    // config mistakes worth catching at startup rather than producing a
+    // confusing or permanently-wrong health signal.
+    for bad in ["50", "-0.1", "1.5"] {
+        let yaml = format!(
+            "providers:\n  llama:\n    name: llama\n    type: llama_cpp\n    base_url: \"http://localhost:8080\"\n    degraded_error_rate_threshold: {bad}\n"
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("degraded_error_rate_threshold"),
+            "value {bad} should be rejected: {err}"
+        );
+    }
+}
+
+#[test]
+fn in_range_degraded_error_rate_threshold_is_accepted() {
+    for good in ["0.0", "0.5", "1.0"] {
+        let yaml = format!(
+            "providers:\n  llama:\n    name: llama\n    type: llama_cpp\n    base_url: \"http://localhost:8080\"\n    degraded_error_rate_threshold: {good}\n"
+        );
+        assert!(parse(&yaml).is_ok(), "value {good} should be accepted");
+    }
+}
