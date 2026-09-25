@@ -84,3 +84,36 @@ pub trait Provider: Send + Sync {
         anyhow::bail!("Provider '{}' does not support embeddings", self.name())
     }
 }
+
+/// Construct the adapter for a configured provider. Shared by `main.rs` and
+/// the opt-in live smoke tests (`tests/live_provider_smoke_tests.rs`) so the
+/// tests exercise exactly the construction path production uses.
+pub fn build_adapter(config: &crate::types::ProviderConfig) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
+    use crate::types::{ModelCapabilities, ProviderType};
+    use std::sync::Arc;
+
+    Ok(match config.r#type {
+        ProviderType::LlamaCpp => Arc::new(llama_cpp::LlamaCppAdapter::new(config)?),
+        ProviderType::OpenRouter => Arc::new(openrouter::OpenRouterAdapter::new(config)?),
+        ProviderType::Ollama => Arc::new(ollama::OllamaAdapter::new(config)?),
+        ProviderType::OllamaCloud => Arc::new(ollama_cloud::OllamaCloudAdapter::new(config)?),
+        ProviderType::Vllm => Arc::new(vllm::VllmAdapter::new(config)?),
+        ProviderType::Gemini => Arc::new(gemini::GeminiAdapter::new(config)?),
+        ProviderType::HuggingFace => Arc::new(huggingface::HuggingFaceAdapter::new(config)?),
+        ProviderType::OpenAiCompatible => Arc::new(openai_compatible::OpenAICompatibleAdapter::new(
+            config,
+            ModelCapabilities::default(),
+        )?),
+        _ => {
+            tracing::warn!(
+                provider = %config.name,
+                r#type = ?config.r#type,
+                "No dedicated adapter for this provider type, using generic OpenAI-compatible adapter"
+            );
+            Arc::new(openai_compatible::OpenAICompatibleAdapter::new(
+                config,
+                ModelCapabilities::default(),
+            )?)
+        }
+    })
+}

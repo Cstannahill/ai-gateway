@@ -23,6 +23,10 @@ cargo test --all-targets
 cargo test --test routing_tests
 cargo test --test api_tests -- test_health_endpoint
 
+# Opt-in live provider smoke tests (skip silently unless env vars are set):
+# see docs/PROVIDER_INTEGRATION_GUIDE.md "Live Smoke Tests"
+cargo test --test live_provider_smoke_tests -- --nocapture --test-threads=1
+
 # DB-dependent tests (reasoning-visibility ordering, snapshots, cost accounting,
 # the analytics API, and one audit contract probe) degrade to a no-op unless a
 # disposable Postgres is available — see Known limitations below.

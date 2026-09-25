@@ -9,7 +9,6 @@ use ai_gateway::registry::{ModelRegistry, ProviderRegistry};
 use ai_gateway::routing::Router as RoutingEngine;
 use ai_gateway::server::{self, AppState};
 use ai_gateway::telemetry::TelemetryPipeline;
-use ai_gateway::types;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,46 +60,7 @@ async fn main() -> anyhow::Result<()> {
             pconfig.name = name.clone();
         }
 
-        let adapter: Arc<dyn Provider> = match pconfig.r#type {
-            types::ProviderType::LlamaCpp => {
-                Arc::new(providers::llama_cpp::LlamaCppAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::OpenRouter => {
-                Arc::new(providers::openrouter::OpenRouterAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::Ollama => {
-                Arc::new(providers::ollama::OllamaAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::OllamaCloud => {
-                Arc::new(providers::ollama_cloud::OllamaCloudAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::Vllm => {
-                Arc::new(providers::vllm::VllmAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::Gemini => {
-                Arc::new(providers::gemini::GeminiAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::HuggingFace => {
-                Arc::new(providers::huggingface::HuggingFaceAdapter::new(&pconfig)?)
-            }
-            types::ProviderType::OpenAiCompatible => {
-                Arc::new(providers::openai_compatible::OpenAICompatibleAdapter::new(
-                    &pconfig,
-                    types::ModelCapabilities::default(),
-                )?)
-            }
-            _ => {
-                tracing::warn!(
-                    provider = %name,
-                    r#type = ?pconfig.r#type,
-                    "Unsupported provider type, using generic OpenAI-compatible adapter"
-                );
-                Arc::new(providers::openai_compatible::OpenAICompatibleAdapter::new(
-                    &pconfig,
-                    types::ModelCapabilities::default(),
-                )?)
-            }
-        };
+        let adapter: Arc<dyn Provider> = providers::build_adapter(&pconfig)?;
 
         tracing::info!(
             provider = %name,

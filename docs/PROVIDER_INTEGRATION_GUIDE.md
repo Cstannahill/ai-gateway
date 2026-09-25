@@ -285,3 +285,27 @@ types::ProviderType::MyProvider => {
     Arc::new(providers::my_provider::MyProviderAdapter::new(&pconfig)?)
 }
 ```
+
+## Live Smoke Tests (opt-in)
+
+Every other test in this repository uses mock providers, so none can catch a real vendor quirk (auth header shape, URL layout, SSE framing, usage reporting). `tests/live_provider_smoke_tests.rs` sends one tiny non-streaming and one streaming chat request (`max_tokens: 64`, a "reply with pong" prompt) per provider, built through `providers::build_adapter` — the same construction path `main.rs` uses.
+
+Each test is a no-op that prints a `SKIP` line unless its trigger environment variable is set, so a plain `cargo test` stays green, offline, and free. Run the ones you configure with output visible:
+
+```bash
+LIVE_LLAMA_BASE_URL=http://localhost:8080 OPENROUTER_API_KEY=sk-or-... \
+  cargo test --test live_provider_smoke_tests -- --nocapture --test-threads=1
+```
+
+| Provider | Trigger | Model (env → default) |
+|---|---|---|
+| llama.cpp | `LIVE_LLAMA_BASE_URL` | `LIVE_LLAMA_MODEL` → `local` |
+| Ollama | `LIVE_OLLAMA_BASE_URL` | `LIVE_OLLAMA_MODEL` (required) |
+| vLLM | `LIVE_VLLM_BASE_URL` | `LIVE_VLLM_MODEL` (required) |
+| OpenRouter | `OPENROUTER_API_KEY` | `LIVE_OPENROUTER_MODEL` → `openai/gpt-4o-mini` |
+| Gemini | `GEMINI_API_KEY` | `LIVE_GEMINI_MODEL` → `gemini-2.0-flash` |
+| Hugging Face | `HF_API_KEY` | `LIVE_HF_MODEL` (required) |
+| Ollama Cloud | `OLLAMA_API_KEY` | `LIVE_OLLAMA_CLOUD_MODEL` (required); `LIVE_OLLAMA_CLOUD_BASE_URL` → `https://ollama.com` |
+| Generic OpenAI-compatible (also how xai/venice/featherless are served) | `LIVE_GENERIC_BASE_URL` | `LIVE_GENERIC_MODEL` (required); `LIVE_GENERIC_API_KEY` optional |
+
+A provider passes when both requests return no `Error` event, reach a `Completed` event, and produce content or reasoning text; the streaming request must also deliver incremental deltas. Health-check status is printed but not asserted (some endpoints, e.g. Hugging Face's router, don't serve `/models`). Cloud targets cost a fraction of a cent per run. Defaults for base URLs and models are unverified starting points — override them via the env vars if a vendor changes its URL or retires a model.
