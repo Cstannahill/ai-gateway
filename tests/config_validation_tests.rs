@@ -241,3 +241,18 @@ fn llama_server_valid_loopback_config_is_accepted_and_bad_numbers_rejected() {
     let err = parse(&llama_yaml("  host: 0.0.0.0\n")).unwrap_err();
     assert!(err.to_string().contains("llama_server.host"), "{err}");
 }
+
+#[test]
+fn invalid_default_header_name_or_value_is_rejected() {
+    // These are skipped when requests are built, which for OpenRouter would
+    // silently drop the app-attribution headers.
+    for (header, value) in [("Bad Header", "x"), ("HTTP-Referer", "https://a.example\\x01")] {
+        let yaml = format!(
+            "providers:\n  or:\n    name: or\n    type: open_router\n    base_url: \"https://openrouter.ai/api\"\n    default_headers:\n      \"{header}\": \"{value}\"\n"
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err.to_string().contains("default_headers"), "{header}: {err}");
+    }
+    let ok = "providers:\n  or:\n    name: or\n    type: open_router\n    base_url: \"https://openrouter.ai/api\"\n    default_headers:\n      HTTP-Referer: \"https://me.example\"\n      X-OpenRouter-Title: \"My App\"\n";
+    parse(ok).expect("valid headers are accepted");
+}

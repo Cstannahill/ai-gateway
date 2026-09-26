@@ -110,10 +110,13 @@ providers:
     # Environment variable holding the secret API key (recommended over static keys)
     api_key_env: "OPENROUTER_API_KEY"
     timeout_secs: 120
-    # Default HTTP headers to attach to every outgoing request
-    default_headers:
-      "HTTP-Referer": "http://localhost:8999"
-      "X-Title": "Personal AI Gateway"
+    # Extra HTTP headers for every outgoing request. OpenRouter app-attribution
+    # headers are added automatically (HTTP-Referer: https://ai-gateway.local,
+    # X-OpenRouter-Title: AI Gateway); set them here only to override. Names are
+    # case-insensitive. See docs/PROVIDER_INTEGRATION_GUIDE.md, "App attribution".
+    # default_headers:
+    #   "HTTP-Referer": "https://ai-gateway.local"
+    #   "X-OpenRouter-Title": "AI Gateway"
 
   vllm:
     name: "vllm"
@@ -352,7 +355,10 @@ pricing:
 
 ## 3. Environment Variable Interpolation
 
-The gateway natively reads secrets from your environment:
+The gateway natively reads secrets from your environment. It also loads a
+`.env` file from the current directory at startup (or the file given with
+`--env-file <PATH>`); variables already set in the real environment win over the
+file. Copy `.env.example` to `.env` to start. See `COMMANDS.md` section 2.
 
 | Variable | Description | Example |
 |:---|:---|:---|

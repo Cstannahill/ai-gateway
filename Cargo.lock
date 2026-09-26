@@ -24,6 +24,7 @@ dependencies = [
  "chrono",
  "config",
  "dashmap",
+ "dotenvy",
  "futures",
  "hyper",
  "pin-project-lite",

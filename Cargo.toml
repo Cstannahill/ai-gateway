@@ -45,6 +45,7 @@ anyhow = "1"
 bytes = "1"
 dashmap = "6"
 config = { version = "0.15", features = ["yaml"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -81,10 +81,32 @@ providers:
     base_url: "https://openrouter.ai/api"
     api_key_env: "OPENROUTER_API_KEY"
     timeout_secs: 120
-    default_headers:
-      "HTTP-Referer": "http://localhost:8999"
-      "X-Title": "Personal AI Gateway"
+    # App-attribution headers are sent automatically; see below.
 ```
+
+#### App attribution
+OpenRouter credits usage to an app only when requests carry an `HTTP-Referer`, and shows it under the name in `X-OpenRouter-Title` ([docs](https://openrouter.ai/docs/app-attribution)). The gateway adds both to **every** request it sends to OpenRouter (chat, streaming, `/models`, health checks) with no configuration:
+
+| Header | Default | Notes |
+|:---|:---|:---|
+| `HTTP-Referer` | `https://ai-gateway.local` | The app's unique identifier at OpenRouter. Changing it starts a new app in their analytics. |
+| `X-OpenRouter-Title` | `AI Gateway` | Display name. The legacy `X-Title` is honoured if you set it instead. |
+| `X-OpenRouter-Categories` | not sent | Optional, e.g. `cli-agent,personal-agent` (max 2 recognised categories). |
+| `X-OpenRouter-App-Visibility` | not sent | Set `hidden` to keep a *new* app off the public rankings (attribution and your own analytics still work; ignored for an app that already exists). |
+
+Override or add any of them per provider with `default_headers`. Names are case-insensitive, and your value replaces the default rather than duplicating it:
+
+```yaml
+providers:
+  openrouter:
+    default_headers:
+      "HTTP-Referer": "https://github.com/you/ai-gateway"
+      "X-OpenRouter-Title": "My AI Gateway"
+      "X-OpenRouter-Categories": "personal-agent"
+      "X-OpenRouter-App-Visibility": "hidden"
+```
+
+The headers are also applied to any provider, whatever its `type`, whose `base_url` host is `openrouter.ai`, so a generic OpenAI-compatible entry pointed at OpenRouter is attributed too. An invalid header name or value in `default_headers` is a startup error rather than being silently dropped. `tests/openrouter_attribution_tests.rs` verifies the headers on the wire.
 
 #### Supported Escape Hatch Parameters (`provider_options`)
 Pass options under `"openrouter"` or `"open_router"`:

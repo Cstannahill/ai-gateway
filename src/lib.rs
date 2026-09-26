@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod llama_server;
 pub mod providers;

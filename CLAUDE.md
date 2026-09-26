@@ -8,6 +8,8 @@ AI Gateway is a personal, high-performance Rust reverse proxy (Axum/Tokio) that 
 
 ## Commands
 
+The full list of commands, CLI flags, environment variables, and HTTP endpoints is in `COMMANDS.md` (its `--help` block must match `src/cli.rs::HELP`; a unit test enforces it — update both together).
+
 ```bash
 # Build & run
 cargo run --release                          # starts server (default port 8999)
@@ -38,7 +40,7 @@ docker run --rm -d -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:16
 AUDIT_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres cargo test --all-targets
 ```
 
-Environment variables read at startup (see `docs/CONFIGURATION_GUIDE.md` for the full list): `DATABASE_URL`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `HF_API_KEY`, `OLLAMA_API_KEY`, `RUST_LOG`. There is no dotenv loader — a `.env` file in the repo root is not automatically read by the binary.
+Environment variables read at startup (see `docs/CONFIGURATION_GUIDE.md` for the full list): `DATABASE_URL`, `RUST_LOG`, and whatever each provider's `api_key_env` names (conventionally `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `HF_API_KEY`, `OLLAMA_API_KEY`). The binary loads `./.env` (current directory only) or `--env-file <PATH>` before logging starts; real environment variables win over the file. `.env.example` lists every variable; `COMMANDS.md` documents the flags.
 
 Config resolution order: CLI arg path → `config/gateway.yaml` → `gateway.yaml` (cwd) → built-in defaults with a warning.
 
@@ -47,6 +49,7 @@ Toolchain: Rust edition 2024, requires Rust 1.88+ (let-chains); the README's sta
 ## Architecture
 
 ### Module map (`src/`)
+- `cli.rs` — hand-rolled argument parser and the `--help` text (`HELP`); the binary takes `[CONFIG]`/`-c`, `-h`, `-V` only.
 - `config/` — YAML config loading/validation (`GatewayConfig`, `ServerConfig`, `ProviderConfig`, model definitions).
 - `types/` — canonical internal domain models: `GatewayRequest`/`GatewayResponse` (request.rs/response.rs), `ModelDefinition`/`ModelCapabilities` (model.rs), `ProviderType`/`ProviderHealth` (provider.rs), `ReasoningOutput` (reasoning.rs).
 - `registry/` — `ModelRegistry` (alias → candidate array resolution) and `ProviderRegistry` (live adapter instances, health, lock-free `DashMap` state).

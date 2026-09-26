@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+use ai_gateway::cli;
 use ai_gateway::config::GatewayConfig;
 use ai_gateway::providers::{self, Provider};
 use ai_gateway::registry::{ModelRegistry, ProviderRegistry};
@@ -10,8 +11,46 @@ use ai_gateway::routing::Router as RoutingEngine;
 use ai_gateway::server::{self, AppState};
 use ai_gateway::telemetry::TelemetryPipeline;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Synchronous on purpose: the command line and the `.env` file are handled
+/// before the multi-threaded runtime exists, because mutating the process
+/// environment is only sound while no other thread is running.
+fn main() -> anyhow::Result<()> {
+    // ─── Parse the command line (before logging, so --help output is clean) ─
+    let (config_path, env_file) = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Action::Run { config_path, env_file }) => (config_path, env_file),
+        Ok(cli::Action::Help) => {
+            print!("{}", cli::HELP);
+            return Ok(());
+        }
+        Ok(cli::Action::Version) => {
+            println!("{}", cli::version_line());
+            return Ok(());
+        }
+        Err(message) => {
+            eprintln!("error: {message}\n\nRun 'ai-gateway --help' for usage.");
+            std::process::exit(2);
+        }
+    };
+
+    // ─── Load .env (before logging, so RUST_LOG in it takes effect) ──────
+    let loaded_env_file = match cli::load_env_file(env_file.as_deref()) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+    };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(config_path, loaded_env_file))
+}
+
+async fn run(
+    config_path: Option<String>,
+    loaded_env_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
     // ─── Initialize logging ──────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -23,9 +62,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("AI Gateway v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(path) = &loaded_env_file {
+        tracing::info!(file = %path.display(), "Loaded environment variables from file");
+    }
 
     // ─── Load configuration ──────────────────────────────────────────────
-    let config_path = std::env::args().nth(1);
     let config = GatewayConfig::load(config_path.as_deref())?;
 
     tracing::info!(

@@ -92,6 +92,17 @@ pub fn build_adapter(config: &crate::types::ProviderConfig) -> anyhow::Result<st
     use crate::types::{ModelCapabilities, ProviderType};
     use std::sync::Arc;
 
+    // A provider that is not typed `open_router` but points at openrouter.ai
+    // (e.g. a generic OpenAI-compatible entry) must still be attributed.
+    let attributed = openrouter::attributed_config_for_host(config);
+    if attributed.is_some() {
+        tracing::info!(
+            provider = %config.name,
+            "base_url is openrouter.ai; adding OpenRouter app-attribution headers"
+        );
+    }
+    let config = attributed.as_ref().unwrap_or(config);
+
     Ok(match config.r#type {
         ProviderType::LlamaCpp => Arc::new(llama_cpp::LlamaCppAdapter::new(config)?),
         ProviderType::OpenRouter => Arc::new(openrouter::OpenRouterAdapter::new(config)?),

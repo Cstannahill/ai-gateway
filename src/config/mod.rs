@@ -401,8 +401,12 @@ const IMPLEMENTED_ROUTING_POLICIES: &[&str] = &[
 impl GatewayConfig {
     /// Load configuration from a YAML file.
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref())?;
-        let config: GatewayConfig = serde_yaml::from_str(&content)?;
+        use anyhow::Context;
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config file '{}'", path.display()))?;
+        let config: GatewayConfig = serde_yaml::from_str(&content)
+            .with_context(|| format!("invalid config file '{}'", path.display()))?;
         config.validate()?;
         Ok(config)
     }
@@ -497,6 +501,25 @@ impl GatewayConfig {
                     "provider '{}' has max_concurrent: 0, which would make it permanently at capacity — omit the field for no limit, or set a positive value",
                     name
                 );
+            }
+            // An invalid header name/value is skipped when requests are
+            // built, so the header would silently never be sent — for
+            // OpenRouter that means silently losing app attribution.
+            for (header, value) in provider.default_headers.iter().flatten() {
+                if reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                    anyhow::bail!(
+                        "provider '{}' has default_headers entry '{}' which is not a valid HTTP header name",
+                        name,
+                        header
+                    );
+                }
+                if reqwest::header::HeaderValue::from_str(value).is_err() {
+                    anyhow::bail!(
+                        "provider '{}' has default_headers entry '{}' with a value that is not valid in an HTTP header (control characters or a newline?)",
+                        name,
+                        header
+                    );
+                }
             }
             if provider.rate_limit_per_sec == Some(0) {
                 anyhow::bail!(
