@@ -2,3 +2,7 @@
 .env
 DEV_PROFILE*.md
 .developer_profile_analysis.md
+
+# llama-server manager state (local model paths)
+config/llama_models.json
+config/llama_models.json.bak*

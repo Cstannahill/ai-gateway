@@ -124,8 +124,10 @@ from the repo root (or pass `--env-file`).
 
 The four `*_API_KEY` names are only conventions: a provider reads whichever
 variable its own `api_key_env` field names (the sample `config/gateway.yaml`
-uses `GOOGLE_AI_API_KEY` for its commented-out Gemini entry). A missing or
-malformed key surfaces as an unhealthy provider, not a crash.
+uses exactly these four). A provider only exists if it is listed under
+`providers:` in the config; a key in `.env` for an unlisted provider is
+ignored. A missing or malformed key surfaces as an unhealthy provider, not a
+crash.
 
 Test-only variables are listed in [section 4](#4-opt-in-live-tests); the
 frontend's are in [section 5](#5-frontend-commands).

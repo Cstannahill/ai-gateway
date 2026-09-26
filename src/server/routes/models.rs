@@ -5,6 +5,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Json};
 
 use crate::server::AppState;
+use crate::types::ModelCapabilities;
 
 /// GET /v1/models
 ///
@@ -32,16 +33,25 @@ pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let adapters = state.provider_registry.all_adapters();
     let query_futures = adapters.into_iter().map(|(provider_name, adapter)| {
         async move {
+            let streaming = adapter.capabilities().streaming;
             match tokio::time::timeout(std::time::Duration::from_secs(3), adapter.models()).await {
-                Ok(Ok(provider_models)) => Some((provider_name, provider_models)),
+                Ok(Ok(provider_models)) => Some((provider_name, provider_models, streaming)),
                 _ => None,
             }
         }
     });
 
     let results = futures::future::join_all(query_futures).await;
-    for (provider_name, models) in results.into_iter().flatten() {
+    for (provider_name, models, provider_streaming) in results.into_iter().flatten() {
         for m in models {
+            // Providers do not report per-model capabilities, and the response
+            // contract (docs/API_REFERENCE.md, frontend validator) is an object,
+            // never null. Only what the adapter itself guarantees is claimed:
+            // streaming. Everything else is `false` = "not known to be supported".
+            let capabilities = m.capabilities.clone().unwrap_or(ModelCapabilities {
+                streaming: provider_streaming,
+                ..Default::default()
+            });
             let full_id = if m.id.starts_with(&format!("{}/", provider_name)) {
                 m.id.clone()
             } else {
@@ -64,7 +74,7 @@ pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                         "object": m.object,
                         "created": m.created,
                         "owned_by": if m.owned_by.is_empty() { provider_name.clone() } else { m.owned_by },
-                        "capabilities": m.capabilities,
+                        "capabilities": capabilities,
                         "providers": [provider_name.clone()],
                     })
                 });

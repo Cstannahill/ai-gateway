@@ -5,9 +5,9 @@
 # CLI argument: ai-gateway path/to/config.yaml
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1" # loopback only: required while llama_server is enabled
   port: 8999
-  body_limit_bytes: 52428800  # 50 MB
+  body_limit_bytes: 52428800 # 50 MB
   shutdown_timeout_secs: 30
 
 # ─── Providers ──────────────────────────────────────────────────────────────
@@ -33,29 +33,35 @@ providers:
     base_url: "http://localhost:11434"
     timeout_secs: 300
 
-  # ollama-cloud:
-  #   name: ollama-cloud
-  #   type: ollama
-  #   base_url: "https://your-ollama-cloud-endpoint"
-  #   api_key_env: OLLAMA_CLOUD_API_KEY
+  # Keys come from the environment (.env is loaded at startup - see .env.example).
+  # A provider whose key is unset shows as unhealthy; the gateway still starts.
+
+  ollama_cloud:
+    name: ollama_cloud
+    type: ollama_cloud
+    base_url: "https://ollama.com"
+    api_key_env: OLLAMA_API_KEY
+    timeout_secs: 300
+
+  gemini:
+    name: gemini
+    type: gemini
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    api_key_env: GEMINI_API_KEY
+    timeout_secs: 120
+
+  huggingface:
+    name: huggingface
+    type: hugging_face
+    base_url: "https://router.huggingface.co/v1"
+    api_key_env: HF_API_KEY
+    timeout_secs: 120
 
   # vllm:
   #   name: vllm
   #   type: vllm
   #   base_url: "http://localhost:8000"
   #   timeout_secs: 300
-
-  # google:
-  #   name: google
-  #   type: gemini
-  #   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
-  #   api_key_env: GOOGLE_AI_API_KEY
-
-  # huggingface:
-  #   name: huggingface
-  #   type: hugging_face
-  #   base_url: "https://router.huggingface.co/v1"
-  #   api_key_env: HF_API_KEY
 
 # ─── Models ─────────────────────────────────────────────────────────────────
 # Each model is an alias that maps to one or more provider/model candidates.
@@ -82,7 +88,7 @@ models:
     description: "Strong coding model — cloud frontier"
     candidates:
       - provider: openrouter
-        model: anthropic/claude-sonnet-4
+        model: xiaomi/mimo-v2.6-flash
         priority: 1
     capabilities:
       tools: true
@@ -102,7 +108,7 @@ models:
         model: qwen3.5:9b
         priority: 2
       - provider: openrouter
-        model: google/gemini-2.5-flash
+        model: xiaomi/mimo-v2.6-flash
         priority: 3
     capabilities:
       tools: true
@@ -139,14 +145,14 @@ telemetry:
 # set. Point `binary` at the real .exe, not a .cmd shim. Keep `port` equal to
 # the `llama` provider's port above. See docs/CONFIGURATION_GUIDE.md.
 #
-# llama_server:
-#   enabled: true
-#   binary: 'S:\llama.cpp\build\bin\Release\llama-server.exe'
-#   host: 127.0.0.1
-#   port: 8080
-#   state_file: config/llama_models.json
-#   scan_dirs: ['S:\Code\Models']
-#   start_timeout_secs: 300
+llama_server:
+  enabled: true
+  binary: 'S:\llama.cpp\build\bin\Release\llama-server.exe'
+  host: 127.0.0.1
+  port: 8080 # must match the `llama` provider's port above
+  state_file: config/llama_models.json
+  scan_dirs: ['S:\Code\Models']
+  start_timeout_secs: 300
 
 # ─── Pricing (optional) ───────────────────────────────────────────────────────
 # Keyed by "provider/model". A deployment with no entry here simply produces
