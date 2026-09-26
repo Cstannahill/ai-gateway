@@ -34,6 +34,15 @@ The browser calls same-origin `/api/gateway/*`. The Next server forwards only al
 - Comparison with metric selection, up to six selected provider/model pairs, sortable table and scoped export.
 - Recent recovery evidence with separate distinct requests/failed-attempt counts; provider/model capability inventory and local search.
 - Dark/light themes, UTC/local display, keyboard controls, reduced motion, narrow layouts, pause/manual refresh and stale-data indicators.
+- Local llama-server management: saved GGUF models, arguments, process status, switching, defaults, scanned paths, and live logs.
+
+## llama-server manager
+
+Open [llama-server](http://127.0.0.1:3000/?view=llama) or [the labelled demo](http://127.0.0.1:3000/?view=llama&demo=1). The manager is disabled by default. The disabled view shows the required `server.host: 127.0.0.1` and `llama_server` configuration, including the real `llama-server.exe` path. See [the UI contract](../docs/frontend/LLAMA_SERVER_UI.md) for the complete setup and behavior.
+
+The browser uses a dedicated same-origin `/api/llama-server/*` proxy. It checks the route, method, origin, query, UUID, JSON body, and size before calling the gateway. The server-side outbound request uses only JSON content negotiation, so browser `Origin`, cookies, credentials, and `Sec-Fetch-*` headers never reach the guarded gateway routes. A start or switch can launch a real local process; the UI confirms disruptive switch, restart, stop, and delete actions. Demo mode uses in-memory fixtures and makes no gateway requests.
+
+Status polls every second while starting or loading and every five seconds otherwise. Visible logs tail by cursor without browser persistence. Model paths are typed or chosen from the gateway's configured scan directories; browser file inputs cannot provide absolute paths.
 
 No date selector is shown because current reads cannot honor a historical range. Fleet usage/spend, routing evidence, stable cursor pagination, exact choice identity and complete capture guarantees require backend additions. Current comparison and usage limitations are explained in the UI and in [API gaps](../docs/frontend/API_GAPS.md). See [metric definitions](../docs/frontend/METRICS.md) and the [feature-to-data map](../docs/frontend/IMPLEMENTATION.md).
 

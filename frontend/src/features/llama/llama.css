@@ -1,0 +1,53 @@
+.llama-pad { padding: 18px 20px; display: grid; gap: 13px; }
+.llama-status-top, .llama-actions, .llama-facts, .llama-row-actions, .llama-log-controls, .llama-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.llama-status-top { color: var(--muted); font-size: 12px; }
+.llama-status-top .badge.warn { animation: llama-pulse 1.6s ease-in-out infinite; }
+@keyframes llama-pulse { 50% { opacity: .55; } }
+.llama-pad h3 { font-size: 21px; letter-spacing: -.02em; }
+.llama-path { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.llama-path strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llama-facts { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.llama-facts > span:not(.badge) { border-right: 1px solid var(--border); padding-right: 9px; }
+.llama-small, .llama-updated { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.llama-small button, .llama-path button { min-height: 26px; font-size: 10px; }
+.llama-callout { background: var(--accent-dim); border: 1px solid var(--accent); border-radius: 6px; padding: 12px; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.llama-callout.danger, .llama-field-error { color: var(--red); background: var(--red-bg); border-color: var(--red); }
+.llama-callout button { margin-left: 7px; }
+.llama-code { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 12px; font-size: 11px; line-height: 1.55; max-height: 250px; overflow: auto; }
+.llama-field { display: grid; gap: 5px; font-size: 11px; font-weight: 600; min-width: 0; }
+.llama-field input, .llama-field select, .llama-field textarea { width: 100%; font-weight: 400; }
+.llama-field textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 9px; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical; }
+.llama-field small { font-weight: 400; color: var(--muted); }
+.llama-check { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; }
+.llama-preview { display: grid; gap: 8px; font-size: 11px; }
+.llama-preview p[role=alert] { color: var(--red); }
+.llama-chips code { background: var(--panel-alt); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; overflow-wrap: anywhere; }
+.llama-preview details p { color: var(--muted); line-height: 1.6; max-width: 750px; }
+.llama-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.llama-table th, .llama-table td { padding: 11px 13px; border-top: 1px solid var(--border); text-align: left; vertical-align: middle; }
+.llama-table th { color: var(--muted); }
+.llama-table td:first-child { display: flex; gap: 6px; align-items: center; }
+.llama-running { background: var(--accent-dim); }
+.llama-truncate { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.llama-row-actions { flex-wrap: nowrap; }
+.llama-row-actions button { font-size: 10px; padding: 4px 7px; }
+.llama-modal-backdrop { position: fixed; inset: 0; z-index: 80; background: #000a; display: grid; place-items: center; padding: 16px; }
+.llama-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 81; width: min(550px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; display: grid; gap: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 18px 70px #0006; }
+.llama-modal h2 { font-size: 18px; }
+.llama-modal p { font-size: 11px; line-height: 1.5; color: var(--muted); }
+.llama-model-dialog { width: min(700px, calc(100vw - 32px)); }
+.llama-dialog-body { display: grid; gap: 11px; overflow: auto; max-height: 65dvh; padding-right: 3px; }
+.llama-field-error { border: 1px solid; border-radius: 5px; padding: 8px; }
+.llama-picker { display: grid; gap: 5px; border: 1px solid var(--border); border-radius: 5px; padding: 8px; max-height: 200px; overflow: auto; }
+.llama-picker button { justify-content: space-between; text-align: left; }
+.llama-picker small { color: var(--muted); }
+.llama-log-controls { margin-bottom: 5px; }
+.llama-log-controls label { display: inline-flex; align-items: center; gap: 5px; }
+.llama-log { max-height: 340px; min-height: 120px; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 10px; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }
+.llama-log.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.llama-log .stderr { color: var(--amber); }
+.llama-log .gateway, .llama-log .divider { color: var(--accent); font-style: italic; }
+.llama-error { padding: 20px; color: var(--red); font-size: 11px; }
+.llama-scenario { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 11px; background: var(--panel); }
+@media (max-width: 760px) { .llama-row-actions { flex-wrap: wrap; } .llama-table { min-width: 700px; } .llama-log-controls { align-items: stretch; } }
+@media (prefers-reduced-motion: reduce) { .llama-status-top .badge.warn { animation: none; } .llama-status-top, .llama-log { scroll-behavior: auto; } }

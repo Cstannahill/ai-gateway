@@ -13,6 +13,7 @@ import {
   FlaskConical,
   GitBranch,
   LayoutDashboard,
+  Cpu,
   Menu,
   MessageSquare,
   Moon,
@@ -31,6 +32,7 @@ import { ComparisonView } from "@/features/comparison";
 import { Reliability } from "@/features/reliability";
 import { Inventory } from "@/features/inventory";
 import { Chat } from "@/features/chat/chat";
+import { LlamaServer } from "@/features/llama/llama";
 const sections = [
   {
     key: "chat",
@@ -68,6 +70,12 @@ const sections = [
     title: "Inventory",
     icon: Boxes,
     description: "Provider instances and the models they expose.",
+  },
+  {
+    key: "llama",
+    title: "llama-server",
+    icon: Cpu,
+    description: "Manage the local llama-server process, models, and logs.",
   },
 ];
 function Shell({
@@ -319,6 +327,8 @@ export function Console({ requestId }: { requestId?: string }) {
           <Reliability />
         ) : view === "inventory" ? (
           <Inventory />
+        ) : view === "llama" ? (
+          <LlamaServer />
         ) : (
           <Overview />
         )}

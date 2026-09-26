@@ -175,7 +175,7 @@ test("Next chat route enforces same-origin JSON and rejects unsupported payloads
   });
   expect(crossSite.status()).toBe(403);
   const sameSite = await request.post("/api/chat", {
-    headers: { Origin: "http://127.0.0.1:3000" },
+    headers: { Origin: `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? 3000}` },
     data: invalid,
   });
   expect(sameSite.status()).toBe(400);
