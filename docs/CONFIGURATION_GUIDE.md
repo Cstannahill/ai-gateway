@@ -258,6 +258,49 @@ caching:
   max_entries: 1000
 
 
+# ─── 4b. llama-server management ──────────────────────────────────────────────
+# Save models under aliases and start/stop/inspect a local llama-server via
+# `/llama-server/*` (UI contract: docs/frontend/LLAMA_SERVER_UI.md). Disabled by
+# default. It is the only feature that launches a local process, so it is
+# guarded: validation refuses to start when this section is enabled but
+# `server.host` is not loopback (set `allow_non_loopback: true` to override
+# knowingly), and every /llama-server/* request that carries a browser
+# `Origin` (or a non-loopback `Host`) is rejected with 403 — the frontend must
+# reach it through its server-side proxy.
+llama_server:
+  enabled: false
+  # Path to the real llama-server executable. A .cmd/.bat shim is rejected at
+  # startup: stopping a shim would leave the actual server process orphaned.
+  # (S:\bin\llama-server.cmd is such a shim; use the .exe it points to.)
+  binary: 'S:\llama.cpp\build\bin\Release\llama-server.exe'
+  # Passed as --host / --port; also where status probes connect. Keep `port`
+  # equal to the port in the `llama` provider's base_url so the gateway routes
+  # to whatever the manager starts.
+  host: 127.0.0.1
+  port: 8080
+  # Saved models + default args (JSON, atomic writes). A corrupt file fails
+  # startup with a clear message and is never overwritten.
+  state_file: config/llama_models.json
+  # Optional directories the UI's "choose from scanned files" picker may list
+  # *.gguf files from (depth <= 4). Nothing outside these is ever listed.
+  scan_dirs: []
+  # Browser origins allowed to call /llama-server/* directly. Leave empty:
+  # only origin-less callers (the frontend's server-side proxy, curl) pass.
+  allowed_origins: []
+  allow_non_loopback: false
+  # How long to wait for /health to report ready before marking the start
+  # failed and killing the process. Big models load slowly.
+  start_timeout_secs: 300
+  # Captured stdout/stderr lines kept in memory for the log view.
+  log_lines: 2000
+# Model paths themselves are validated when saved (absolute, exists, .gguf) and
+# re-checked at start. Arguments: `-m/--model`, `--mmproj`, `--host`, `--port`
+# and the download/help/exit-immediately flags are owned by the manager and
+# rejected; everything else (e.g. `-ngl all -fa on -np 1 --ui-mcp-proxy`) is
+# passed through. A hard kill of the gateway (no graceful shutdown) leaves the
+# server running; it then shows up as an "external" server.
+
+
 # ─── 5. Observability & PostgreSQL Telemetry ─────────────────────────────────
 telemetry:
   # Global toggle for telemetry recording

@@ -46,6 +46,105 @@ pub struct GatewayConfig {
     /// a change to existing behavior.
     #[serde(default)]
     pub caching: CachingConfig,
+
+    /// Local llama-server process management (`/llama-server/*`). Disabled
+    /// by default — it is the only feature that executes a local binary.
+    #[serde(default)]
+    pub llama_server: LlamaServerConfig,
+}
+
+/// Configuration for the llama-server manager (`src/llama_server/`). See
+/// `docs/CONFIGURATION_GUIDE.md` and `docs/frontend/LLAMA_SERVER_UI.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlamaServerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to the real `llama-server` executable (not a `.cmd` shim — a
+    /// shim leaves the actual server orphaned when stopped).
+    #[serde(default)]
+    pub binary: Option<String>,
+
+    /// Passed as `--host`, and where status probes connect.
+    #[serde(default = "default_llama_host")]
+    pub host: String,
+
+    /// Passed as `--port`. Keep equal to the `llama` provider's port.
+    #[serde(default = "default_llama_port")]
+    pub port: u16,
+
+    /// JSON file holding saved models and default args.
+    #[serde(default = "default_llama_state_file")]
+    pub state_file: String,
+
+    /// Directories the model picker may list `*.gguf` files from. Nothing
+    /// outside these is ever listed or accepted by the scan endpoint.
+    #[serde(default)]
+    pub scan_dirs: Vec<String>,
+
+    /// Browser origins allowed to call `/llama-server/*` directly. Empty by
+    /// default: only origin-less callers (the frontend's server-side proxy,
+    /// curl) are accepted.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Acknowledge that `server.host` is not loopback while this
+    /// process-launching feature is enabled.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
+
+    /// How long to wait for the server to report ready before marking the
+    /// start as failed. Large models load slowly.
+    #[serde(default = "default_llama_start_timeout_secs")]
+    pub start_timeout_secs: u64,
+
+    /// Ring-buffer size for captured stdout/stderr lines.
+    #[serde(default = "default_llama_log_lines")]
+    pub log_lines: usize,
+}
+
+impl Default for LlamaServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: None,
+            host: default_llama_host(),
+            port: default_llama_port(),
+            state_file: default_llama_state_file(),
+            scan_dirs: vec![],
+            allowed_origins: vec![],
+            allow_non_loopback: false,
+            start_timeout_secs: default_llama_start_timeout_secs(),
+            log_lines: default_llama_log_lines(),
+        }
+    }
+}
+
+fn default_llama_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_llama_port() -> u16 {
+    8080
+}
+
+fn default_llama_state_file() -> String {
+    "config/llama_models.json".to_string()
+}
+
+fn default_llama_start_timeout_secs() -> u64 {
+    300
+}
+
+fn default_llama_log_lines() -> usize {
+    2000
+}
+
+/// True for `localhost` and loopback IP literals.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
 /// Cost per 1,000 tokens for one provider/model deployment, in USD.
@@ -416,6 +515,53 @@ impl GatewayConfig {
             }
         }
 
+        self.validate_llama_server()?;
+
+        Ok(())
+    }
+
+    /// Checks for the llama-server manager. Only enforced when enabled, so a
+    /// half-filled section never blocks a gateway that isn't using it.
+    fn validate_llama_server(&self) -> anyhow::Result<()> {
+        let ls = &self.llama_server;
+        if !ls.enabled {
+            return Ok(());
+        }
+        let Some(binary) = ls.binary.as_deref().filter(|b| !b.trim().is_empty()) else {
+            anyhow::bail!("llama_server.binary is required when llama_server.enabled is true");
+        };
+        if !Path::new(binary).is_file() {
+            anyhow::bail!("llama_server.binary '{binary}' does not exist or is not a file");
+        }
+        let lower = binary.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            anyhow::bail!(
+                "llama_server.binary '{binary}' is a batch shim; point it at the real llama-server executable so stopping the server actually terminates it"
+            );
+        }
+        if ls.port == 0 {
+            anyhow::bail!("llama_server.port must be greater than 0");
+        }
+        if ls.log_lines == 0 {
+            anyhow::bail!("llama_server.log_lines must be greater than 0");
+        }
+        if ls.start_timeout_secs == 0 {
+            anyhow::bail!("llama_server.start_timeout_secs must be greater than 0");
+        }
+        if !is_loopback_host(&ls.host) && !ls.allow_non_loopback {
+            anyhow::bail!(
+                "llama_server.host '{}' is not loopback; the managed server would be reachable from the network. Set llama_server.allow_non_loopback: true to acknowledge",
+                ls.host
+            );
+        }
+        // This feature can launch a local process, so refuse to expose it on a
+        // network-facing bind without an explicit acknowledgement.
+        if !is_loopback_host(&self.server.host) && !ls.allow_non_loopback {
+            anyhow::bail!(
+                "llama_server is enabled but server.host '{}' is not loopback, so /llama-server/* (which starts a local process) would be reachable from the network. Bind server.host to 127.0.0.1, or set llama_server.allow_non_loopback: true to acknowledge",
+                self.server.host
+            );
+        }
         Ok(())
     }
 
@@ -428,6 +574,7 @@ impl GatewayConfig {
             telemetry: TelemetryConfig::default(),
             pricing: HashMap::new(),
             caching: CachingConfig::default(),
+            llama_server: LlamaServerConfig::default(),
         }
     }
 

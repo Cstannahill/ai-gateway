@@ -181,6 +181,7 @@ async fn test_models_endpoint_namespacing() {
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
+        llama_server: None,
         analytics_pool: None,
     });
 

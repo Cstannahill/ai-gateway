@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+pub mod llama_server;
 pub mod providers;
 pub mod registry;
 pub mod routing;

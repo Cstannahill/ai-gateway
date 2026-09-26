@@ -2,6 +2,8 @@
 
 Additions only: `frontend/` and these frontend documents. Existing Rust, configuration, migrations, tests, and documentation remain untouched.
 
+llama-server management UI: see [LLAMA_SERVER_UI.md](LLAMA_SERVER_UI.md) (backend complete; UI to be built from that contract).
+
 | Experience           | Verified source contract                                          | Population / boundary                                                                                   |
 | -------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | Operational overview | `/health`; `/metrics.gateway` and `.providers`                    | Since process restart; errors and active counts are provider attempts                                   |

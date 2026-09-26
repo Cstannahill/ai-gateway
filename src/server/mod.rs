@@ -53,6 +53,9 @@ pub struct AppState {
     /// disabling caching costs nothing at the call sites, not just at
     /// startup (docs/REMEDIATION_PLAN.md Phase 5 caching work).
     pub response_cache: Option<Arc<crate::cache::ResponseCache>>,
+    /// llama-server process manager behind `/llama-server/*`. `None` unless
+    /// `llama_server.enabled` — the only feature that executes a local binary.
+    pub llama_server: Option<Arc<crate::llama_server::LlamaServerManager>>,
 }
 
 impl AppState {
@@ -84,6 +87,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(routes::openai_routes())
         .merge(routes::management_routes())
         .merge(routes::analytics_routes())
+        .merge(routes::llama_server_routes(state.clone()))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .layer(PropagateRequestIdLayer::x_request_id())

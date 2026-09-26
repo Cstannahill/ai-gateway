@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod health;
+pub mod llama_server;
 pub mod metrics;
 pub mod models;
 pub mod providers;
@@ -9,7 +10,7 @@ pub mod responses;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 
 use super::AppState;
@@ -48,4 +49,32 @@ pub fn analytics_routes() -> Router<Arc<AppState>> {
         .route("/v1/analytics/fallbacks", get(analytics::fallback_analysis))
         .route("/v1/analytics/costs", get(analytics::cost_summary))
         .route("/v1/analytics/persistence", get(analytics::persistence_health))
+}
+
+/// Local llama-server management (`/llama-server/*`). Every route, reads
+/// included, sits behind `llama_server::browser_guard` — see that module for
+/// why (process launching + permissive CORS).
+pub fn llama_server_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/llama-server/status", get(llama_server::status))
+        .route("/llama-server/start", post(llama_server::start))
+        .route("/llama-server/stop", post(llama_server::stop))
+        .route("/llama-server/restart", post(llama_server::restart))
+        .route("/llama-server/logs", get(llama_server::logs))
+        .route(
+            "/llama-server/models",
+            get(llama_server::list_models).post(llama_server::create_model),
+        )
+        .route("/llama-server/models/scan", get(llama_server::scan_models))
+        .route("/llama-server/models/validate", post(llama_server::validate_model))
+        .route(
+            "/llama-server/models/{id}",
+            put(llama_server::update_model).delete(llama_server::delete_model),
+        )
+        .route(
+            "/llama-server/defaults",
+            get(llama_server::get_defaults).put(llama_server::set_defaults),
+        )
+        .route("/llama-server/args/parse", post(llama_server::parse_args))
+        .route_layer(axum::middleware::from_fn_with_state(state, llama_server::browser_guard))
 }

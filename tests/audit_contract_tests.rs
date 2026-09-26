@@ -178,6 +178,7 @@ fn setup(
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
+        llama_server: None,
             analytics_pool: None,
         }),
         rx,
@@ -231,6 +232,7 @@ fn setup_embeddings(
             total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
+        llama_server: None,
             analytics_pool: None,
         }),
         rx,
@@ -669,6 +671,7 @@ async fn response_cache_serves_a_repeated_non_streaming_request_without_a_second
             std::time::Duration::from_secs(60),
             100,
         ))),
+        llama_server: None,
         analytics_pool: None,
     });
 

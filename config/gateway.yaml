@@ -132,6 +132,22 @@ telemetry:
   store_stream_events: true
   # fallback_log_path: telemetry_fallback.jsonl
 
+# ─── llama-server management (optional, off by default) ───────────────────────
+# Lets the gateway (and its UI) save models, start/stop llama-server, and show
+# what is loaded. This is the only feature that launches a local process, so it
+# requires server.host to be loopback (127.0.0.1) unless allow_non_loopback is
+# set. Point `binary` at the real .exe, not a .cmd shim. Keep `port` equal to
+# the `llama` provider's port above. See docs/CONFIGURATION_GUIDE.md.
+#
+# llama_server:
+#   enabled: true
+#   binary: 'S:\llama.cpp\build\bin\Release\llama-server.exe'
+#   host: 127.0.0.1
+#   port: 8080
+#   state_file: config/llama_models.json
+#   scan_dirs: ['S:\Code\Models']
+#   start_timeout_secs: 300
+
 # ─── Pricing (optional) ───────────────────────────────────────────────────────
 # Keyed by "provider/model". A deployment with no entry here simply produces
 # no cost_records row — never a fabricated zero cost.

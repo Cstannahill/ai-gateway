@@ -28,6 +28,7 @@ fn setup_test_app() -> axum::Router {
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
+        llama_server: None,
         analytics_pool: None,
     });
 
@@ -174,6 +175,7 @@ async fn test_gateway_request_counter_counts_actual_requests() {
         total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
+        llama_server: None,
         analytics_pool: None,
     });
 
@@ -253,6 +255,7 @@ async fn test_persistence_health_counts_dropped_events_and_channel_backlog() {
         telemetry_health,
         analytics_pool: None,
         response_cache: None,
+        llama_server: None,
     });
 
     // Fill the one slot, then overflow it twice.

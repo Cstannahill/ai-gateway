@@ -115,6 +115,20 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    let llama_server = if config.llama_server.enabled {
+        let manager = ai_gateway::llama_server::LlamaServerManager::new(config.llama_server.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("llama_server: {e}"))?;
+        tracing::info!(
+            binary = config.llama_server.binary.as_deref().unwrap_or(""),
+            port = config.llama_server.port,
+            "llama-server management enabled (/llama-server/*)"
+        );
+        Some(Arc::new(manager))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         config: config.clone(),
         model_registry,
@@ -126,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         analytics_pool,
         telemetry_health: telemetry.health(),
         response_cache,
+        llama_server: llama_server.clone(),
     });
 
     // ─── Snapshot configured models once at startup ───────────────────────
@@ -254,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = health_shutdown_tx.send(());
     if let Err(e) = health_task.await {
         tracing::warn!(error = %e, "Health check worker did not shut down cleanly");
+    }
+    // Stop the managed llama-server (if any) so the gateway never leaves an
+    // orphaned model process holding GPU memory.
+    if let Some(manager) = llama_server {
+        manager.shutdown().await;
     }
     drop(state);
     telemetry.shutdown().await;

@@ -183,3 +183,61 @@ fn in_range_degraded_error_rate_threshold_is_accepted() {
         assert!(parse(&yaml).is_ok(), "value {good} should be accepted");
     }
 }
+
+// ─── llama_server section ────────────────────────────────────────────────────
+
+fn llama_yaml(extra: &str) -> String {
+    // Cargo.toml stands in for an existing "binary" file; validation only
+    // checks that the path is a real, non-batch file.
+    let binary = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").replace(std::path::MAIN_SEPARATOR, "/");
+    format!("server:\n  host: 127.0.0.1\nllama_server:\n  enabled: true\n  binary: \"{binary}\"\n{extra}")
+}
+
+#[test]
+fn disabled_llama_server_section_is_never_validated() {
+    assert!(parse("llama_server:\n  enabled: false\n  binary: /nope\n  port: 0\n").is_ok());
+}
+
+#[test]
+fn enabled_llama_server_requires_an_existing_binary() {
+    let err = parse("server:\n  host: 127.0.0.1\nllama_server:\n  enabled: true\n").unwrap_err();
+    assert!(err.to_string().contains("llama_server.binary"), "{err}");
+    let err = parse("server:\n  host: 127.0.0.1\nllama_server:\n  enabled: true\n  binary: /definitely/not/here\n").unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
+}
+
+#[test]
+fn llama_server_batch_shim_binary_is_rejected() {
+    let shim = std::env::temp_dir().join("ai_gateway_test_shim.cmd");
+    std::fs::write(&shim, "@echo off\n").unwrap();
+    let yaml = format!(
+        "server:\n  host: 127.0.0.1\nllama_server:\n  enabled: true\n  binary: \"{}\"\n",
+        shim.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+    );
+    let err = parse(&yaml).unwrap_err();
+    assert!(err.to_string().contains("batch shim"), "{err}");
+    let _ = std::fs::remove_file(shim);
+}
+
+#[test]
+fn enabled_llama_server_refuses_a_network_facing_gateway_bind_without_acknowledgement() {
+    // Default server.host is 0.0.0.0 — process launching must not be
+    // reachable from the network by accident.
+    let binary = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").replace(std::path::MAIN_SEPARATOR, "/");
+    let yaml = format!("llama_server:\n  enabled: true\n  binary: \"{binary}\"\n");
+    let err = parse(&yaml).unwrap_err();
+    assert!(err.to_string().contains("not loopback"), "{err}");
+
+    let acked = format!("{yaml}  allow_non_loopback: true\n");
+    assert!(parse(&acked).is_ok());
+}
+
+#[test]
+fn llama_server_valid_loopback_config_is_accepted_and_bad_numbers_rejected() {
+    assert!(parse(&llama_yaml("")).is_ok());
+    for bad in ["  port: 0\n", "  log_lines: 0\n", "  start_timeout_secs: 0\n"] {
+        assert!(parse(&llama_yaml(bad)).is_err(), "{bad} should be rejected");
+    }
+    let err = parse(&llama_yaml("  host: 0.0.0.0\n")).unwrap_err();
+    assert!(err.to_string().contains("llama_server.host"), "{err}");
+}

@@ -693,3 +693,27 @@ When an error occurs, the gateway returns standard OpenAI-compatible error paylo
 | `422` | `unprocessable_entity` | Parameter validation failed (e.g. invalid temperature range) |
 | `502` | `all_providers_failed` | All candidate providers in the fallback plan failed or timed out |
 | `504` | `gateway_timeout` | The candidate attempt exceeded `attempt_timeout_secs` |
+
+---
+
+## 16. `/llama-server/*` — llama-server management
+
+Optional (`llama_server.enabled`, default off). Save models under aliases and start/stop/inspect a local `llama-server` process. **Full request/response schemas, states, error codes, and UI behavior are in [`docs/frontend/LLAMA_SERVER_UI.md`](frontend/LLAMA_SERVER_UI.md)**; this is the summary.
+
+**Access rules.** Every route (reads included) rejects requests carrying a browser `Origin` header (unless listed in `llama_server.allowed_origins`), a `Sec-Fetch-Site: cross-site|same-site` header, or a non-loopback `Host` — `403` `origin_forbidden` / `host_forbidden`. Non-browser callers (curl, the frontend's server-side proxy) send none of these and pass. When the feature is disabled, `GET /llama-server/status` returns `200 {"enabled": false, "state": "disabled"}`; every other route returns `404` `feature_disabled` (except the pure `args/parse`).
+
+| Method | Path | Purpose |
+|:---|:---|:---|
+| `GET` | `/llama-server/status` | state (`stopped`/`starting`/`loading`/`ready`/`exited`/`failed`), managed vs external, pid/uptime, the started model and effective args/argv, what the live server reports (`/props` + `/v1/models`: model path, context size, params, vision, slots, build), matched saved model, last exit with log tail |
+| `POST` | `/llama-server/start` | `{model_id \| alias, args?, replace?, save_args?}` → `202` + status; poll status until `ready` |
+| `POST` | `/llama-server/stop` | stop (idempotent) → status |
+| `POST` | `/llama-server/restart` | restart last model with the same effective args → `202` |
+| `GET` | `/llama-server/logs?after=&limit=` | cursor-tailed stdout/stderr ring buffer `{lines, next_cursor, truncated, state}` |
+| `GET`/`POST` | `/llama-server/models` | list saved models (+ `default_args`, `running_model_id`) / create (`201`) |
+| `PUT`/`DELETE` | `/llama-server/models/{id}` | replace / delete (`409 model_in_use` if running) |
+| `POST` | `/llama-server/models/validate` | dry-run validation of a would-be model (always `200`, `valid` flag) |
+| `GET` | `/llama-server/models/scan` | `*.gguf` files under the configured `scan_dirs` only |
+| `GET`/`PUT` | `/llama-server/defaults` | global default argument string |
+| `POST` | `/llama-server/args/parse` | tokenize + validate an argument string (`argv`, `issues`) |
+
+Errors use the standard envelope `{"error": {"message", "type", "code"}}`. Codes: `feature_disabled`, `not_found`, `invalid_request`, `invalid_alias`, `invalid_path`, `path_not_found`, `path_not_file`, `not_gguf`, `reserved_flag`, `invalid_args` (400); `alias_taken`, `already_running`, `model_in_use`, `port_in_use`, `nothing_to_restart` (409); `spawn_failed`, `internal_error` (500). A malformed JSON body yields the framework's plain-text `400/415/422`.

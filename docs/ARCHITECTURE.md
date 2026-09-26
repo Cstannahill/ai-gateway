@@ -182,3 +182,21 @@ src/
 - **Zero Global Locks in Fast Path**: Active request tracking and provider states use lock-free [`DashMap`](file:///s:/Code/RustProjects/AI-Gateway/src/registry/provider_registry.rs#L20) structures.
 - **Connection Pooling**: Upstream HTTP calls share persistent `reqwest::Client` connection pools per provider adapter.
 - **Backpressure Protection**: Telemetry channels use bounded queues. If the database lags severely, events drop gracefully with warnings rather than exhausting server memory.
+
+---
+
+## 6. llama-server manager (optional)
+
+`src/llama_server/` (off unless `llama_server.enabled`) lets the gateway own a local `llama-server` process, exposed at `/llama-server/*` (`src/server/routes/llama_server.rs`; UI contract in `docs/frontend/LLAMA_SERVER_UI.md`). It is independent of routing and telemetry: it only makes the process the gateway's `llama` provider talks to controllable.
+
+| Piece | File | Role |
+|:---|:---|:---|
+| Saved models | `store.rs` | JSON file (atomic writes) of aliases → gguf/mmproj/args + global default args; validates paths (absolute, exists, `.gguf`), aliases, and args |
+| Args | `args.rs` | Windows-safe tokenizer (backslashes literal, quotes group; no shell involved) + reserved-flag list |
+| Supervisor | `manager.rs` | One child at a time. Per run: two log-reader tasks, a *waiter* owning the `Child`, and a *poller* moving `starting → loading → ready` via `/health` and enforcing `start_timeout_secs`. All tasks update shared state only while their `run_id` is current |
+| Probe | `probe.rs` | Best-effort reads of `/health`, `/props`, `/v1/models` (fields vary by llama.cpp build → all optional) |
+| Logs | `logs.rs` | Bounded ring buffer with monotonically increasing sequence numbers for cursor tailing |
+
+Lifecycle: `start` validates files/args, refuses if something already answers on the port (`port_in_use`), spawns `binary` with argv built as `-m <gguf> [--mmproj <p>] --host --port <user args> [--alias]` (no shell), and returns `202`; `stop` kills and reaps; graceful gateway shutdown calls `LlamaServerManager::shutdown()` before telemetry drains (`main.rs`). A hard kill of the gateway cannot run that and leaves the server running, which the next gateway reports as `external`.
+
+Security: this is the only feature that executes a local binary, and the gateway's CORS is permissive, so the module is disabled by default, config validation refuses a network-facing `server.host` unless acknowledged, and a guard middleware rejects every `/llama-server/*` request that carries a browser `Origin`, cross-site `Sec-Fetch-Site`, or non-loopback `Host` (defeating both cross-site requests and DNS rebinding). Only the configured `binary` is ever run; a `.cmd` shim is rejected because stopping it would orphan the real process.
