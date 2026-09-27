@@ -73,6 +73,27 @@ pub struct LlamaServerConfig {
     #[serde(default = "default_llama_port")]
     pub port: u16,
 
+    /// Name of the entry under `providers:` that talks to this server. The
+    /// gateway then lists the saved models under that provider, reports it as
+    /// available while a model can still be loaded on demand, and (with
+    /// `auto_swap`) loads the model a request names. `null` disables the link.
+    /// If no provider has this name the link is skipped with a warning.
+    #[serde(default = "default_llama_provider")]
+    pub provider: Option<String>,
+
+    /// When a request to `provider` names a saved model (by alias or by
+    /// `.gguf` path) that is not the one loaded, stop the current model and
+    /// start the requested one before dispatching. Names that are not saved
+    /// models are passed through untouched to whatever is loaded.
+    #[serde(default = "default_true")]
+    pub auto_swap: bool,
+
+    /// How long a swap waits for in-flight requests on the current model to
+    /// finish before giving up (the request then fails over to the next
+    /// candidate).
+    #[serde(default = "default_llama_swap_drain_timeout_secs")]
+    pub swap_drain_timeout_secs: u64,
+
     /// JSON file holding saved models and default args.
     #[serde(default = "default_llama_state_file")]
     pub state_file: String,
@@ -110,6 +131,9 @@ impl Default for LlamaServerConfig {
             binary: None,
             host: default_llama_host(),
             port: default_llama_port(),
+            provider: default_llama_provider(),
+            auto_swap: true,
+            swap_drain_timeout_secs: default_llama_swap_drain_timeout_secs(),
             state_file: default_llama_state_file(),
             scan_dirs: vec![],
             allowed_origins: vec![],
@@ -126,6 +150,14 @@ fn default_llama_host() -> String {
 
 fn default_llama_port() -> u16 {
     8080
+}
+
+fn default_llama_provider() -> Option<String> {
+    Some("llama".to_string())
+}
+
+fn default_llama_swap_drain_timeout_secs() -> u64 {
+    120
 }
 
 fn default_llama_state_file() -> String {
@@ -584,6 +616,26 @@ impl GatewayConfig {
                 "llama_server is enabled but server.host '{}' is not loopback, so /llama-server/* (which starts a local process) would be reachable from the network. Bind server.host to 127.0.0.1, or set llama_server.allow_non_loopback: true to acknowledge",
                 self.server.host
             );
+        }
+        if ls.swap_drain_timeout_secs == 0 {
+            anyhow::bail!("llama_server.swap_drain_timeout_secs must be greater than 0");
+        }
+        // The provider link only means something if that provider really talks
+        // to the process the manager launches; otherwise a "swap" would change
+        // a server the provider never uses.
+        if let Some(name) = ls.provider.as_deref()
+            && let Some(provider) = self.providers.get(name)
+        {
+            let host_matches = provider.base_url.host_str().is_some_and(is_loopback_host);
+            let port_matches = provider.base_url.port_or_known_default() == Some(ls.port);
+            if !host_matches || !port_matches {
+                anyhow::bail!(
+                    "llama_server.provider '{name}' has base_url {} but the managed server listens on {}:{}; they must match so requests reach the model the gateway loads. Fix the provider's base_url or llama_server.port, or set llama_server.provider: null to unlink them",
+                    provider.base_url,
+                    ls.host,
+                    ls.port
+                );
+            }
         }
         Ok(())
     }

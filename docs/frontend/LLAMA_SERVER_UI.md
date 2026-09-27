@@ -136,6 +136,8 @@ interface Status {
   failure: string | null;
   last_exit: ExitInfo | null;
   endpoint: { host: string; port: number; base_url: string };
+  provider: string | null;   // gateway provider this server backs (llama_server.provider); null = not linked
+  auto_swap: boolean;         // true = a request naming another saved model swaps to it automatically
 }
 type StatusResponse = Status | { enabled: false; state: "disabled"; message: string };
 
@@ -377,6 +379,13 @@ llama_server:
 Startup validation rejects: missing/nonexistent `binary`, a `.cmd`/`.bat` shim (stopping a shim would orphan the real process), `port: 0`, and — because this feature launches a process — `server.host` not being loopback (unless `llama_server.allow_non_loopback: true`). Saved models live in `state_file` (JSON, human-editable while the gateway is stopped; a corrupt file makes startup fail with a clear message rather than being overwritten).
 
 Relationship to routing: whatever the manager runs at `llama_server.port` is what the gateway's `llama` provider (`http://localhost:8080` in the sample config) talks to. The gateway's provider health check runs every 30 s, so the provider can appear unhealthy for up to ~30 s after the model becomes `ready`; mention this in the UI ("Provider health refreshes every 30 s") next to the endpoint line.
+
+**Saved models are also chat models (new).** When `provider` is set, every saved model appears in `GET /v1/models` as `<provider>/<alias>` (e.g. `llama/Gemma4-E4B-AD`, `vision: true` if it has an mmproj) even when nothing is loaded, so the existing chat model picker lists them under the provider filter with no UI work. Selecting one and sending a message makes the gateway load it first (`auto_swap`): the first token can take as long as the model needs to load, and it replaces the currently loaded model, after in-flight requests finish. What to show in this panel:
+
+- Next to the endpoint line: "Serves gateway provider **`<provider>`**" and, when `auto_swap` is true, "Requests for a saved model load it automatically." When `provider` is null, say the server is not linked to a provider.
+- The loaded model can change without the user pressing Start here (a chat request swapped it). Keep polling status (§6) and show it live; treat a change of `model.id` between polls as normal, not an error.
+- Chat UI: while a chat message is waiting on a model swap there is no error and no data for a while; a spinner with "Loading model…" is appropriate. A swap can fail (file moved, out of memory, busy): the chat request then fails over to another candidate or returns an error whose message explains it.
+- Starting/replacing a model from this panel does **not** wait for in-flight chat requests; keep the confirmation in §7.
 
 Lifecycle: a graceful gateway shutdown (Ctrl+C) stops the managed llama-server. A hard kill of the gateway cannot, and leaves an orphan that shows up as `external` (§5.6).
 

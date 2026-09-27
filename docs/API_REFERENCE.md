@@ -700,6 +700,14 @@ When an error occurs, the gateway returns standard OpenAI-compatible error paylo
 
 Optional (`llama_server.enabled`, default off). Save models under aliases and start/stop/inspect a local `llama-server` process. **Full request/response schemas, states, error codes, and UI behavior are in [`docs/frontend/LLAMA_SERVER_UI.md`](frontend/LLAMA_SERVER_UI.md)**; this is the summary.
 
+**Serving requests (gateway ↔ llama-server link).** With `llama_server.provider` (default `llama`) pointing at a configured provider, that provider and the manager act as one:
+
+- `GET /v1/models` lists every saved model as `<provider>/<alias>` (e.g. `llama/Gemma4-E4B-AD`) whether or not it is loaded; `capabilities.vision` is `true` when the model has an mmproj, other flags are `false` (unknown).
+- A chat/responses/embeddings request whose model resolves to that provider and names a saved model (alias, case-insensitive, or the saved `.gguf` path) makes sure that model is loaded first: already loaded → dispatch immediately; loading → wait; different or nothing loaded → wait for in-flight requests to drain, stop the current model, start the requested one, wait until ready, then dispatch (`llama_server.auto_swap`, on by default). Requests are serialized around swaps, never killed by them. Any other model name (such as the target of a config alias) is passed through to whatever is loaded. An unsaved `.gguf` path is refused (`model_not_saved`).
+- Failure to swap (file missing, load failure, still busy after `swap_drain_timeout_secs`) fails that attempt as `unavailable`, so routing falls through to the next candidate. The route's `attempt_timeout_secs` also bounds a swap; if it is shorter than your slowest model load, the load continues in the background and the automatic retry resumes waiting for it. Set it above your slowest load time.
+- `GET /providers` reports the linked provider as `degraded` while no model is loaded but a saved one can be started, and `unhealthy` only when nothing can be started. Provider health refreshes every 30 s.
+- `GET /llama-server/status` includes `provider` (the linked provider name or `null`) and `auto_swap`.
+
 **Access rules.** Every route (reads included) rejects requests carrying a browser `Origin` header (unless listed in `llama_server.allowed_origins`), a `Sec-Fetch-Site: cross-site|same-site` header, or a non-loopback `Host` — `403` `origin_forbidden` / `host_forbidden`. Non-browser callers (curl, the frontend's server-side proxy) send none of these and pass. When the feature is disabled, `GET /llama-server/status` returns `200 {"enabled": false, "state": "disabled"}`; every other route returns `404` `feature_disabled` (except the pure `args/parse`).
 
 | Method | Path | Purpose |

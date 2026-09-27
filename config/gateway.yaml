@@ -150,6 +150,8 @@ llama_server:
   binary: 'S:\llama.cpp\build\bin\Release\llama-server.exe'
   host: 127.0.0.1
   port: 8080 # must match the `llama` provider's port above
+  provider: llama # this provider lists the saved models and loads the one a request names
+  auto_swap: true # a request for another saved model swaps to it (false = manual control only)
   state_file: config/llama_models.json
   scan_dirs: ['S:\Code\Models']
   start_timeout_secs: 300

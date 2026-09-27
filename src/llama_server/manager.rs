@@ -53,6 +53,17 @@ pub enum State {
     Failed,
 }
 
+/// How a saved model relates to the managed process (see `serving`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Serving {
+    /// It is loaded and answering.
+    Ready,
+    /// It was started and is still loading.
+    Loading,
+    /// Something else (or nothing) is running.
+    No,
+}
+
 impl State {
     fn is_running(self) -> bool {
         matches!(self, State::Starting | State::Loading | State::Ready)
@@ -138,6 +149,10 @@ pub struct StatusSnapshot {
     pub failure: Option<String>,
     pub last_exit: Option<ExitInfo>,
     pub endpoint: Endpoint,
+    /// The gateway provider this server backs (see `llama_server.provider`).
+    pub provider: Option<String>,
+    /// Whether a request naming a different saved model swaps to it.
+    pub auto_swap: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +259,91 @@ impl LlamaServerManager {
         if s.state.is_running() { s.model.as_ref().map(|m| m.id) } else { None }
     }
 
+    // ─── Serving a request's model (the gateway-provider link) ───────────
+
+    /// Map the model name of a request (an alias, or a `.gguf` path) to a
+    /// saved model. `Ok(None)` means "not one of ours" - e.g. a configured
+    /// alias target like `qwen3.5-9b` - and the caller should pass the request
+    /// through to whatever is loaded. A `.gguf` path that is not saved is an
+    /// error: requests never get to load arbitrary files.
+    pub async fn resolve_saved(&self, name: &str) -> Result<Option<SavedModel>, LlamaError> {
+        let name = name.trim();
+        let models = self.store.list().await;
+        if name.to_ascii_lowercase().ends_with(".gguf") {
+            return models
+                .into_iter()
+                .find(|m| probe::same_path(&m.gguf_path, name))
+                .map(Some)
+                .ok_or_else(|| {
+                    LlamaError::invalid(
+                        "model_not_saved",
+                        format!("'{name}' is not a saved model; save it (with an alias) before requesting it"),
+                    )
+                });
+        }
+        Ok(models.into_iter().find(|m| m.alias.eq_ignore_ascii_case(name)))
+    }
+
+    /// Whether the managed process is (or is becoming) the given saved model.
+    pub fn serving(&self, id: Uuid) -> Serving {
+        let s = self.lock_shared();
+        match (&s.model, s.state) {
+            (Some(m), State::Ready) if m.id == id => Serving::Ready,
+            (Some(m), State::Starting | State::Loading) if m.id == id => Serving::Loading,
+            _ => Serving::No,
+        }
+    }
+
+    /// True when a server answers on the configured port that this gateway
+    /// did not start, so it cannot be swapped.
+    pub async fn external_server_present(&self) -> bool {
+        !self.state().is_running() && probe::health(&self.http, &self.base_url()).await.is_some()
+    }
+
+    /// Make the given saved model the one being served, and wait until it is
+    /// ready: nothing to do if it already is, wait if it is loading, otherwise
+    /// replace whatever is running. The caller is responsible for making sure
+    /// no request is still using the current model.
+    pub async fn ensure_loaded(&self, id: Uuid) -> Result<(), LlamaError> {
+        if self.serving(id) == Serving::No {
+            self.start(id, None, true).await?;
+        }
+        self.wait_until_ready(id).await
+    }
+
+    async fn wait_until_ready(&self, id: Uuid) -> Result<(), LlamaError> {
+        // The poller already fails a run after `start_timeout_secs`; this is a
+        // backstop in case that task itself has died.
+        let deadline = Instant::now() + Duration::from_secs(self.config.start_timeout_secs + 30);
+        loop {
+            match self.serving(id) {
+                Serving::Ready => return Ok(()),
+                Serving::Loading => {}
+                Serving::No => {
+                    let reason = {
+                        let s = self.lock_shared();
+                        s.failure
+                            .clone()
+                            .or_else(|| s.last_exit.as_ref().map(|e| e.reason.clone()))
+                            .unwrap_or_else(|| "it stopped or was replaced".to_string())
+                    };
+                    return Err(LlamaError::Failed {
+                        code: "swap_failed",
+                        message: format!("llama-server did not become ready with the requested model: {reason}"),
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(LlamaError::Failed {
+                    code: "swap_timeout",
+                    message: "timed out waiting for the requested model to load".to_string(),
+                });
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+
     // ─── Status ──────────────────────────────────────────────────────────
 
     pub async fn status(&self) -> StatusSnapshot {
@@ -298,6 +398,8 @@ impl LlamaServerManager {
                 port: self.config.port,
                 base_url: self.base_url(),
             },
+            provider: self.config.provider.clone(),
+            auto_swap: self.config.auto_swap,
         }
     }
 

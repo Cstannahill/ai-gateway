@@ -92,6 +92,22 @@ async fn run(
         "Telemetry pipeline initialized"
     );
 
+    // ─── llama-server manager (optional) ─────────────────────────────────
+    // Built before the providers so the linked provider can be wrapped.
+    let llama_server = if config.llama_server.enabled {
+        let manager = ai_gateway::llama_server::LlamaServerManager::new(config.llama_server.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("llama_server: {e}"))?;
+        tracing::info!(
+            binary = config.llama_server.binary.as_deref().unwrap_or(""),
+            port = config.llama_server.port,
+            "llama-server management enabled (/llama-server/*)"
+        );
+        Some(Arc::new(manager))
+    } else {
+        None
+    };
+
     // ─── Initialize provider registry ────────────────────────────────────
     let mut provider_registry = ProviderRegistry::new();
 
@@ -101,7 +117,20 @@ async fn run(
             pconfig.name = name.clone();
         }
 
-        let adapter: Arc<dyn Provider> = providers::build_adapter(&pconfig)?;
+        let mut adapter: Arc<dyn Provider> = providers::build_adapter(&pconfig)?;
+
+        // The provider that talks to the managed llama-server also lists the
+        // saved models and loads the requested one on demand.
+        if let Some(manager) = &llama_server
+            && manager.config().provider.as_deref() == Some(name.as_str())
+        {
+            adapter = Arc::new(providers::llama_managed::ManagedLlamaProvider::new(adapter, manager.clone()));
+            tracing::info!(
+                provider = %name,
+                auto_swap = manager.config().auto_swap,
+                "Provider is backed by the managed llama-server"
+            );
+        }
 
         tracing::info!(
             provider = %name,
@@ -111,6 +140,16 @@ async fn run(
         );
 
         provider_registry.register(pconfig, adapter);
+    }
+
+    if let Some(manager) = &llama_server
+        && let Some(linked) = manager.config().provider.as_deref()
+        && !config.providers.contains_key(linked)
+    {
+        tracing::warn!(
+            provider = linked,
+            "llama_server.provider is not defined under providers:; saved models will not be routable (set llama_server.provider: null to silence this)"
+        );
     }
 
     // ─── Initialize model registry ───────────────────────────────────────
@@ -155,20 +194,6 @@ async fn run(
             config.caching.max_entries,
         ))
     });
-
-    let llama_server = if config.llama_server.enabled {
-        let manager = ai_gateway::llama_server::LlamaServerManager::new(config.llama_server.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("llama_server: {e}"))?;
-        tracing::info!(
-            binary = config.llama_server.binary.as_deref().unwrap_or(""),
-            port = config.llama_server.port,
-            "llama-server management enabled (/llama-server/*)"
-        );
-        Some(Arc::new(manager))
-    } else {
-        None
-    };
 
     let state = Arc::new(AppState {
         config: config.clone(),

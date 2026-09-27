@@ -348,6 +348,16 @@ curl -X POST http://127.0.0.1:8999/llama-server/stop
 In JSON bodies use forward slashes in Windows paths (`S:/models/...`); a bare
 backslash must be escaped as `\\`.
 
+### Saved models as chat models
+
+With `llama_server.provider` (default `llama`) set to a configured provider, every saved model is listed in `GET /v1/models` as `llama/<alias>`, and a request for one loads it first (`auto_swap`, default on):
+
+```bash
+curl http://127.0.0.1:8999/v1/chat/completions -H 'Content-Type: application/json' \n  -d '{"model":"llama/Gemma4-E4B-AD","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The request may also name a saved model's `.gguf` path. It waits for in-flight requests on the current model, replaces it, waits until ready, then runs. Names that are not saved models (like the target of a config alias) go to whatever is loaded. Details: [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) section 16.
+
 ### Argument rules for llama-server
 
 - Args are a single string, tokenized Windows-safely: whitespace separates

@@ -256,3 +256,36 @@ fn invalid_default_header_name_or_value_is_rejected() {
     let ok = "providers:\n  or:\n    name: or\n    type: open_router\n    base_url: \"https://openrouter.ai/api\"\n    default_headers:\n      HTTP-Referer: \"https://me.example\"\n      X-OpenRouter-Title: \"My App\"\n";
     parse(ok).expect("valid headers are accepted");
 }
+
+#[test]
+fn llama_server_provider_link_defaults_and_validation() {
+    fn provider(base_url: &str) -> String {
+        format!("providers:\n  llama:\n    name: llama\n    type: llama_cpp\n    base_url: \"{base_url}\"\n")
+    }
+    let with = |base_url: &str, extra: &str| format!("{}{}", provider(base_url), llama_yaml(extra));
+
+    // Defaults: linked to a provider named "llama", auto-swap on.
+    let cfg = parse(&with("http://localhost:8080", "")).unwrap();
+    assert_eq!(cfg.llama_server.provider.as_deref(), Some("llama"));
+    assert!(cfg.llama_server.auto_swap);
+
+    // Loopback spellings of the same port are fine.
+    for url in ["http://127.0.0.1:8080", "http://localhost:8080/v1", "http://[::1]:8080"] {
+        parse(&with(url, "")).unwrap_or_else(|e| panic!("{url}: {e}"));
+    }
+
+    // A provider that does not talk to the managed server is a misconfiguration.
+    let err = parse(&with("http://localhost:9999", "")).unwrap_err();
+    assert!(err.to_string().contains("llama_server.provider 'llama'"), "{err}");
+    let err = parse(&with("http://example.com:8080", "")).unwrap_err();
+    assert!(err.to_string().contains("must match"), "{err}");
+
+    // ...unless the link is turned off, or the port is changed to match.
+    parse(&with("http://localhost:9999", "  provider: null\n")).unwrap();
+    parse(&with("http://localhost:9999", "  port: 9999\n")).unwrap();
+
+    // A link to a provider that is not defined is skipped, not an error.
+    parse(&llama_yaml("  provider: nonexistent\n")).unwrap();
+
+    assert!(parse(&llama_yaml("  swap_drain_timeout_secs: 0\n")).is_err());
+}

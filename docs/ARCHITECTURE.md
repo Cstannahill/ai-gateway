@@ -187,7 +187,7 @@ src/
 
 ## 6. llama-server manager (optional)
 
-`src/llama_server/` (off unless `llama_server.enabled`) lets the gateway own a local `llama-server` process, exposed at `/llama-server/*` (`src/server/routes/llama_server.rs`; UI contract in `docs/frontend/LLAMA_SERVER_UI.md`). It is independent of routing and telemetry: it only makes the process the gateway's `llama` provider talks to controllable.
+`src/llama_server/` (off unless `llama_server.enabled`) lets the gateway own a local `llama-server` process, exposed at `/llama-server/*` (`src/server/routes/llama_server.rs`; UI contract in `docs/frontend/LLAMA_SERVER_UI.md`). The manager itself is independent of routing and telemetry, but it is linked to the gateway's `llama` provider (`llama_server.provider`) by a wrapper adapter, `providers/llama_managed.rs::ManagedLlamaProvider`, so the two behave as one (below).
 
 | Piece | File | Role |
 |:---|:---|:---|
@@ -196,6 +196,8 @@ src/
 | Supervisor | `manager.rs` | One child at a time. Per run: two log-reader tasks, a *waiter* owning the `Child`, and a *poller* moving `starting → loading → ready` via `/health` and enforcing `start_timeout_secs`. All tasks update shared state only while their `run_id` is current |
 | Probe | `probe.rs` | Best-effort reads of `/health`, `/props`, `/v1/models` (fields vary by llama.cpp build → all optional) |
 | Logs | `logs.rs` | Bounded ring buffer with monotonically increasing sequence numbers for cursor tailing |
+
+**Provider link.** `ManagedLlamaProvider` wraps the ordinary llama.cpp adapter, so every route (chat, responses, embeddings, model listing) gets the behavior without route changes: `models()` adds the saved models; `health()` reports `Degraded` (routing only skips `Unhealthy`) when cold-but-loadable; `execute()`/`embeddings()` call `acquire(model)`. `acquire` resolves the requested name to a saved model (`LlamaServerManager::resolve_saved`) and, if that model is not `Serving::Ready`, swaps. Swaps are coordinated with a `tokio::sync::RwLock` gate: every request holds a *read* guard for as long as its response is being produced (the guard is moved into the returned stream, so it lives until the client is done), a swap needs the *write* guard, which waits for in-flight requests to drain and holds back new ones. Read-then-check, not check-then-read, so a swap cannot slip in between a request's check and its use of the server. The load itself runs on a detached task (`ensure_loaded`), so a request cancelled or timed out mid-swap does not leave the server half-switched; the retry finds it loading and waits. Not swappable (passed through): names that are not saved models, and a server the gateway did not start (`external`).
 
 Lifecycle: `start` validates files/args, refuses if something already answers on the port (`port_in_use`), spawns `binary` with argv built as `-m <gguf> [--mmproj <p>] --host --port <user args> [--alias]` (no shell), and returns `202`; `stop` kills and reaps; graceful gateway shutdown calls `LlamaServerManager::shutdown()` before telemetry drains (`main.rs`). A hard kill of the gateway cannot run that and leaves the server running, which the next gateway reports as `external`.
 

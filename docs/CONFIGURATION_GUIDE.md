@@ -281,6 +281,23 @@ llama_server:
   # to whatever the manager starts.
   host: 127.0.0.1
   port: 8080
+  # Which entry under `providers:` talks to this server (default "llama"; null
+  # unlinks). Linked, that provider (a) lists the saved models by alias in
+  # /v1/models even while nothing is loaded, (b) reports "degraded" instead of
+  # "unhealthy" while no model is loaded but one can be, so routing still sends
+  # it requests, and (c) with auto_swap, loads the saved model a request names.
+  # Its base_url must point at host:port above (loopback) or startup fails.
+  # If no provider has this name, the link is skipped with a warning.
+  provider: llama
+  # A request to `provider` naming a saved model (its alias, case-insensitive,
+  # or its .gguf path) that is not the loaded one stops the current model and
+  # starts the requested one before dispatching. Any other model name is passed
+  # through to whatever is loaded. A .gguf path that is not saved is refused.
+  auto_swap: true
+  # A swap waits this long for in-flight requests on the current model to
+  # finish (it never kills a model mid-request); on timeout the request fails
+  # over to the next candidate.
+  swap_drain_timeout_secs: 120
   # Saved models + default args (JSON, atomic writes). A corrupt file fails
   # startup with a clear message and is never overwritten.
   state_file: config/llama_models.json

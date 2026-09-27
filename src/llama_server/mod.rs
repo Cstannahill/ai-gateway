@@ -11,7 +11,7 @@ pub mod manager;
 pub mod probe;
 pub mod store;
 
-pub use manager::{LlamaServerManager, State, StatusSnapshot};
+pub use manager::{LlamaServerManager, Serving, State, StatusSnapshot};
 
 /// Errors surfaced by the manager. Each maps to a stable `code` string and an
 /// HTTP status (see `server/routes/llama_server.rs`).
