@@ -120,11 +120,13 @@ fn set_path(slot: &mut Option<String>, value: String, what: &str) -> Result<(), 
 ///
 /// A variable that is already set in the real environment is never
 /// overwritten, so `export FOO=...` on the command line always wins.
-/// Returns the file that was loaded, if any. Never logs values.
+/// Returns what was loaded, if anything, including the names of variables whose
+/// real-environment value *differs* from the file's (see
+/// `EnvFileLoad::shadowed`). Never returns or logs values.
 ///
 /// Call this before the async runtime starts: changing the environment is
 /// only sound while no other thread is running.
-pub fn load_env_file(explicit: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+pub fn load_env_file(explicit: Option<&str>) -> Result<Option<EnvFileLoad>, String> {
     let (path, required) = match explicit {
         Some(p) => (std::path::PathBuf::from(p), true),
         None => (std::path::PathBuf::from(".env"), false),
@@ -136,9 +138,29 @@ pub fn load_env_file(explicit: Option<&str>) -> Result<Option<std::path::PathBuf
             Ok(None)
         };
     }
+    // Found before loading: `from_path` leaves already-set variables alone, so
+    // afterwards there is no way to tell that a value was overridden.
+    let shadowed = dotenvy::from_path_iter(&path)
+        .map_err(|e| format!("cannot load env file '{}': {e}", path.display()))?
+        .filter_map(Result::ok)
+        .filter(|(name, value)| std::env::var(name).is_ok_and(|current| current != *value))
+        .map(|(name, _)| name)
+        .collect();
     dotenvy::from_path(&path)
         .map_err(|e| format!("cannot load env file '{}': {e}", path.display()))?;
-    Ok(Some(path))
+    Ok(Some(EnvFileLoad { path, shadowed }))
+}
+
+/// The result of loading an env file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvFileLoad {
+    pub path: std::path::PathBuf,
+    /// Variables set in the file AND already set to a *different* value in the
+    /// real environment (a shell profile, the system settings, an `export`).
+    /// The real environment wins, so the file's value is ignored; callers
+    /// should warn, because a stale key hiding behind a correct `.env` is
+    /// otherwise invisible. Names only.
+    pub shadowed: Vec<String>,
 }
 
 /// `ai-gateway <version>` line printed by `--version`.
@@ -221,16 +243,26 @@ mod tests {
         let id = uuid::Uuid::now_v7().simple().to_string();
         let fresh = format!("AIGW_TEST_FRESH_{id}");
         let preset = format!("AIGW_TEST_PRESET_{id}");
+        let same = format!("AIGW_TEST_SAME_{id}");
         // SAFETY: the names are unique to this test, so no other thread reads them.
-        unsafe { std::env::set_var(&preset, "from-shell") };
+        unsafe {
+            std::env::set_var(&preset, "from-shell");
+            std::env::set_var(&same, "identical");
+        }
 
         let file = temp_env_file(&format!(
-            "# comment\n{fresh}=from-file\nexport {fresh}_EXPORTED=exported\n{preset}=from-file\n{fresh}_QUOTED=\"has spaces # not a comment\"\n"
+            "# comment\n{fresh}=from-file\nexport {fresh}_EXPORTED=exported\n{preset}=from-file\n{same}=identical\n{fresh}_QUOTED=\"has spaces # not a comment\"\n"
         ));
         let loaded = load_env_file(Some(file.to_str().unwrap())).unwrap();
         std::fs::remove_file(&file).ok();
 
-        assert_eq!(loaded.as_deref(), Some(file.as_path()));
+        let loaded = loaded.expect("file was loaded");
+        assert_eq!(loaded.path, file);
+        assert_eq!(
+            loaded.shadowed,
+            std::slice::from_ref(&preset),
+            "only a variable whose real value differs is reported: not values, not identical ones, not unset ones"
+        );
         assert_eq!(std::env::var(&fresh).unwrap(), "from-file");
         assert_eq!(std::env::var(format!("{fresh}_EXPORTED")).unwrap(), "exported");
         assert_eq!(std::env::var(format!("{fresh}_QUOTED")).unwrap(), "has spaces # not a comment");

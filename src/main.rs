@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(
     config_path: Option<String>,
-    loaded_env_file: Option<std::path::PathBuf>,
+    loaded_env_file: Option<cli::EnvFileLoad>,
 ) -> anyhow::Result<()> {
     // ─── Initialize logging ──────────────────────────────────────────────
     tracing_subscriber::fmt()
@@ -62,8 +62,17 @@ async fn run(
         .init();
 
     tracing::info!("AI Gateway v{}", env!("CARGO_PKG_VERSION"));
-    if let Some(path) = &loaded_env_file {
-        tracing::info!(file = %path.display(), "Loaded environment variables from file");
+    if let Some(loaded) = &loaded_env_file {
+        tracing::info!(file = %loaded.path.display(), "Loaded environment variables from file");
+        if !loaded.shadowed.is_empty() {
+            // Names only, never values. The real environment wins over the
+            // file, so a stale value here silently hides the correct one.
+            tracing::warn!(
+                file = %loaded.path.display(),
+                variables = %loaded.shadowed.join(", "),
+                "Already set in the environment to a DIFFERENT value than in the env file; the environment value is used and the file value ignored. Remove them from your shell profile / system environment if the file is the one you want"
+            );
+        }
     }
 
     // ─── Load configuration ──────────────────────────────────────────────

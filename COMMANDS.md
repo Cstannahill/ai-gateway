@@ -106,6 +106,11 @@ The binary loads a dotenv file at startup, before logging and config are set up:
   gateway exits `2`.
 - A variable already set in the real environment **always wins** over the file,
   so `$env:RUST_LOG='debug'` still overrides `.env`.
+  If the two values differ the gateway logs a warning at startup naming the
+  variable (never the value), because a stale key exported by a shell profile
+  or the system settings otherwise hides the correct one in `.env` with no
+  visible sign. Check with `Get-ChildItem Env:OPENROUTER_API_KEY` (PowerShell)
+  and look in `$PROFILE`.
 - The startup log says which file was loaded (never the values).
 - Syntax: `KEY=value`, `export KEY=value`, `#` comments, and quoted values
   (`KEY="has spaces"`). Copy [`.env.example`](.env.example) to `.env` to start.

@@ -15,6 +15,7 @@ llama-server management UI: see [LLAMA_SERVER_UI.md](LLAMA_SERVER_UI.md) (backen
 | Reliability          | `/v1/analytics/fallbacks`                                         | At most 200 failed-attempt rows in successful requests, not 200 distinct requests                       |
 | Inventory            | `/providers`, `/v1/models`                                        | Current registered instances and configured/discovered catalog; no mutation                             |
 | Chat                 | `/v1/models`; `POST /v1/chat/completions` via dedicated `/api/chat` | Up to four explicit models; independent parallel text completions; streamed content/reasoning/usage; no tools or automatic retries |
+| llama-server manager | `/llama-server/*` via dedicated `/api/llama-server/*` | One local process; saved GGUF models, launch settings, live status and logs; guarded same-origin mutations |
 | Usage/cost           | Detail usage only; no cost read endpoint                          | Individual observations; no certified totals, pricing, or spend trends                                  |
 
 Implementation sequence: (1) isolated Next app, transport and metric tests; (2) shell, live overview and comparison; (3) URL-driven explorer, accessible investigation drawer and timeline; (4) reliability, inventory and explicit demo fixtures; (5) build, lint, typecheck, unit and browser verification.

@@ -796,6 +796,32 @@
   --red-bg: #fdeaea;
   --shadow: 0 16px 70px #233c5120;
 }
+/* Modern uses the requested gray and lime as its two palette anchors. */
+:root[data-look="modern"] {
+  --bg: color-mix(in srgb, #5a5a5a 70%, black);
+  --sidebar: color-mix(in srgb, #5a5a5a 58%, black);
+  --panel: #5a5a5a;
+  --panel-alt: color-mix(in srgb, #5a5a5a 92%, white);
+  --hover: color-mix(in srgb, #5a5a5a 84%, white);
+  --border: color-mix(in srgb, #5a5a5a 75%, white);
+  --text: #fff;
+  --muted: #dedede;
+  --accent: #cced00;
+  --accent-dim: color-mix(in srgb, #cced00 19%, #5a5a5a);
+}
+:root[data-theme="light"][data-look="modern"] {
+  --bg: color-mix(in srgb, #5a5a5a 10%, white);
+  --sidebar: #fff;
+  --panel: #fff;
+  --panel-alt: color-mix(in srgb, #5a5a5a 7%, white);
+  --hover: color-mix(in srgb, #5a5a5a 15%, white);
+  --border: color-mix(in srgb, #5a5a5a 32%, white);
+  --text: #252525;
+  --muted: #5a5a5a;
+  /* Lime remains the highlight; darker ink keeps text and chart strokes legible. */
+  --accent: color-mix(in srgb, #cced00 36%, black);
+  --accent-dim: #cced00;
+}
 * {
   box-sizing: border-box;
 }
@@ -1132,6 +1158,16 @@ small {
   min-width: 31px;
   border-color: transparent;
   background: transparent;
+}
+.look-toggle {
+  min-height: 29px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.look-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent);
 }
 .mobile-menu {
   display: none;
@@ -2247,6 +2283,13 @@ th:first-child {
   }
   .topbar-controls {
     gap: 8px;
+  }
+  .look-toggle {
+    min-width: 31px;
+    padding: 5px;
+  }
+  .look-toggle span {
+    display: none;
   }
   .mode-label {
     font-size: 10px;

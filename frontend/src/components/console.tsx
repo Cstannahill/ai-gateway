@@ -17,6 +17,7 @@ import {
   Menu,
   MessageSquare,
   Moon,
+  Palette,
   Pause,
   Play,
   RefreshCw,
@@ -90,6 +91,7 @@ function Shell({
     client = useQueryClient();
   const { mode, paused, setPaused, zone, setZone } = useRuntime();
   const [light, setLight] = useState(false),
+    [look, setLook] = useState<"classic" | "modern">("classic"),
     [mobile, setMobile] = useState(false);
   const current =
     sections.find((s) => s.key === params.get("view")) ?? sections[1];
@@ -100,6 +102,11 @@ function Shell({
       document.documentElement.dataset.theme = "light";
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setLight(true);
+    }
+    const savedLook = localStorage.getItem("gateway-look");
+    if (savedLook === "modern") {
+      document.documentElement.dataset.look = "modern";
+      setLook("modern");
     }
   }, []);
   const href = (view: string) =>
@@ -117,6 +124,12 @@ function Shell({
     setLight(next);
     document.documentElement.dataset.theme = next ? "light" : "dark";
     localStorage.setItem("gateway-theme", next ? "light" : "dark");
+  }
+  function toggleLook() {
+    const next = look === "classic" ? "modern" : "classic";
+    setLook(next);
+    document.documentElement.dataset.look = next;
+    localStorage.setItem("gateway-look", next);
   }
   function toggleMode() {
     const p = new URLSearchParams(params);
@@ -222,6 +235,16 @@ function Shell({
                 <option value="local">Local time</option>
               </select>
             </label>
+            <button
+              className="look-toggle"
+              onClick={toggleLook}
+              aria-label={`Appearance: ${look}. Switch to ${look === "classic" ? "Modern" : "Classic"}`}
+              aria-pressed={look === "modern"}
+              title={`Appearance: ${look}`}
+            >
+              <Palette size={15} />
+              <span>{look === "classic" ? "Classic" : "Modern"}</span>
+            </button>
             <button
               className="icon-button"
               onClick={toggleTheme}
