@@ -296,6 +296,24 @@ pub struct RoutingConfig {
     /// routing for the time it asked for.
     #[serde(default = "default_max_retry_after")]
     pub max_retry_after_secs: u64,
+
+    /// Hold a streaming response until the provider has produced its first
+    /// output (text, reasoning, a tool call, or a clean finish), so a stream
+    /// that fails *before* anything reached the client can be retried or
+    /// failed over like any other failed attempt. The cost is that the
+    /// client's response headers wait for the first token rather than
+    /// arriving immediately. Once the first output is out, a failure can no
+    /// longer be hidden from the client. Default: true.
+    #[serde(default = "default_true")]
+    pub stream_failover: bool,
+
+    /// With `stream_failover`, give up on a provider that has not produced
+    /// any output within this many seconds of the response starting and move
+    /// on. Unset (the default) waits indefinitely - a local model may
+    /// legitimately spend minutes on prompt processing - so set it only for
+    /// cloud providers that sometimes stall.
+    #[serde(default)]
+    pub first_token_timeout_secs: Option<u64>,
 }
 
 impl Default for RoutingConfig {
@@ -306,6 +324,8 @@ impl Default for RoutingConfig {
             fallback_on: default_fallback_triggers(),
             attempt_timeout_secs: default_attempt_timeout(),
             max_retry_after_secs: default_max_retry_after(),
+            stream_failover: true,
+            first_token_timeout_secs: None,
         }
     }
 }

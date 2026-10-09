@@ -134,6 +134,8 @@ uses exactly these four). A provider only exists if it is listed under
 ignored. A missing or malformed key surfaces as an unhealthy provider, not a
 crash.
 
+**Several keys per provider.** A key variable may hold more than one key, comma-separated (`OPENROUTER_API_KEY=sk-a,sk-b`). Requests rotate round-robin across them; a key the provider refuses (`429`, `401`, `403`) is set aside for the `Retry-After` it gave (60 s if none, 10 min for 401/403) and the same request is retried at once on the next key. Only when every key is refused does the failure reach routing's retry/fallback. One key behaves exactly as before.
+
 Test-only variables are listed in [section 4](#4-opt-in-live-tests); the
 frontend's are in [section 5](#5-frontend-commands).
 

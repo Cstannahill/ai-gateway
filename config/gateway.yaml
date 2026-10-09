@@ -126,6 +126,8 @@ routing:
     - server_error
   attempt_timeout_secs: 120
   max_retry_after_secs: 10 # longer Retry-After => fall back at once and skip that provider for the wait
+  stream_failover: true # hold a stream until its first output so pre-output failures fail over (see CONFIGURATION_GUIDE)
+  # first_token_timeout_secs: 60 # abandon a provider that is silent this long (unset = wait)
 
 # ─── Telemetry ──────────────────────────────────────────────────────────────
 

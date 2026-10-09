@@ -41,6 +41,10 @@ impl FallbackTrigger {
                 code == "connection_refused"
                     || code == "dns_error"
                     || code == "unavailable"
+                    // Connection dropped, or ended empty, after the response
+                    // headers: the provider failed to serve this request.
+                    || code == "stream_error"
+                    || code == "empty_stream"
             }
             Self::ServerError => code == "server_error",
             Self::ContentFilter => code == "content_filter",

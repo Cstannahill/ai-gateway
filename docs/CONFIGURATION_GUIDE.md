@@ -116,6 +116,10 @@ providers:
     base_url: "https://openrouter.ai/api"
     # Environment variable holding the secret API key (recommended over static keys)
     api_key_env: "OPENROUTER_API_KEY"
+    # The variable may hold several comma-separated keys (OPENROUTER_API_KEY=k1,k2):
+    # requests rotate across them, and a key answering 429/401/403 is skipped for
+    # the Retry-After it gave (60s if none; 10 min for 401/403) while the same
+    # request is retried on the next key. A single key behaves as before.
     timeout_secs: 120
     # Extra HTTP headers for every outgoing request. OpenRouter app-attribution
     # headers are added automatically (HTTP-Referer: https://ai-gateway.local,
@@ -248,6 +252,19 @@ routing:
   # is skipped by routing ("provider_rate_limited") for the time it asked
   # for, capped at 5 minutes. 0 = never wait, always fall back. Default: 10.
   max_retry_after_secs: 10
+
+  # Streaming responses are held until the provider produces its first output,
+  # so a stream that errors, ends empty, or stalls BEFORE any output is retried
+  # or failed over like any failed attempt instead of reaching the client broken.
+  # The cost: response headers wait for the first token. Failures AFTER output
+  # has started cannot be hidden and are never replayed. Default: true.
+  stream_failover: true
+
+  # With stream_failover: abandon a provider that has produced no output within
+  # this many seconds and move on. Unset = wait indefinitely (a local model may
+  # take minutes to process a long prompt); set it for cloud providers that
+  # sometimes stall.
+  # first_token_timeout_secs: 60
 
   # Failure conditions that trigger fallback to the next candidate
   fallback_on:

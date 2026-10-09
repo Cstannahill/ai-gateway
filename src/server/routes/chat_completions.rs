@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::providers::ProviderOutput;
 use crate::providers::events::ProviderEvent;
 use crate::routing::fallback;
+use crate::routing::stream_preflight::{Preflight, PreflightFailure, preflight};
 use crate::server::AppState;
 use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
 use crate::telemetry::stream_instrumentation::InstrumentedStream;
@@ -339,6 +340,54 @@ async fn dispatch(
                     );
 
                     if request.stream {
+                        // Hold the response until the provider has produced
+                        // something, so a stream that fails or stalls before
+                        // any output is a failed *attempt* (retried / failed
+                        // over) rather than a broken answer the client has
+                        // already started receiving.
+                        let mut instrumented = Box::pin(instrumented);
+                        let mut replay = Vec::new();
+                        if state.config.routing.stream_failover {
+                            let first_token_timeout = state
+                                .config
+                                .routing
+                                .first_token_timeout_secs
+                                .map(std::time::Duration::from_secs);
+                            match preflight(&mut instrumented, first_token_timeout).await {
+                                Preflight::Committed { buffered } => replay = buffered,
+                                Preflight::Failed(failure) => {
+                                    // Dropping the stream cancels the upstream request.
+                                    drop(instrumented);
+                                    last_error = Some(failure.message.clone());
+                                    if failure.unrecorded {
+                                        // No terminal event reached the
+                                        // instrumentation, so record the
+                                        // attempt here.
+                                        state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                                            request_id,
+                                            attempt_number,
+                                            timestamp: Utc::now(),
+                                            status: attempt_status_for_code(&failure.code),
+                                            finish_reason: None,
+                                            provider_response_id: None,
+                                            upstream_provider: None,
+                                            duration_us: (Utc::now() - attempt_started_at)
+                                                .num_microseconds()
+                                                .unwrap_or(0) as u64,
+                                            error_code: Some(failure.code.clone()),
+                                            error_message: Some(failure.message.clone()),
+                                        });
+                                    }
+                                    match after_stream_failure(&state, &retry_config, &candidate.provider, attempt, max_retries, &failure).await {
+                                        FailureAction::Retry => continue,
+                                        FailureAction::NextCandidate => continue 'candidate_loop,
+                                        FailureAction::Respond(response) => return response,
+                                    }
+                                }
+                            }
+                        }
+                        let instrumented = futures::stream::iter(replay).chain(instrumented);
+
                         let chunk_id = format!("{}-{}", kind.id_prefix(), request_id);
                         let created_ts = received_at.timestamp();
                         let candidate_model = candidate.model.clone();
@@ -485,28 +534,20 @@ async fn dispatch(
                         }
 
                         if let Some((code, message, status_code, retryable, retry_after_ms)) = stream_error {
-                            state.provider_registry.record_request_end(&candidate.provider, true);
                             last_error = Some(message.clone());
-
-                            let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
-
-                            if retryable && attempt + 1 < max_retries {
-                                if pace_retry(&state, &retry_config, &candidate.provider, attempt, retry_after_ms).await {
-                                    continue;
-                                }
-                            } else {
-                                note_retry_after(&state, &candidate.provider, retry_after_ms);
+                            let failure = PreflightFailure {
+                                code,
+                                message,
+                                status_code,
+                                retryable,
+                                retry_after_ms,
+                                unrecorded: false,
+                            };
+                            match after_stream_failure(&state, &retry_config, &candidate.provider, attempt, max_retries, &failure).await {
+                                FailureAction::Retry => continue,
+                                FailureAction::NextCandidate => continue 'candidate_loop,
+                                FailureAction::Respond(response) => return response,
                             }
-
-                            if !should_fb {
-                                return error_response(
-                                    StatusCode::from_u16(status_code.unwrap_or(500))
-                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                                    &code,
-                                    &message,
-                                );
-                            }
-                            continue 'candidate_loop;
                         }
 
                         state.provider_registry.record_request_end(&candidate.provider, false);
@@ -1087,4 +1128,50 @@ pub(crate) fn with_gateway_headers(
     set("x-gateway-model", model);
     set("x-gateway-attempts", &attempts.to_string());
     response
+}
+
+/// What to do after an attempt's stream failed before reaching the client.
+pub(crate) enum FailureAction {
+    /// Same provider again (after the pause has been taken).
+    Retry,
+    /// Give up on this provider; try the next candidate.
+    NextCandidate,
+    /// `routing.fallback_on` says this error should not fall through: this is
+    /// the answer for the client.
+    Respond(Response),
+}
+
+/// Shared bookkeeping + decision for an attempt whose stream failed with
+/// nothing sent to the client yet: close out the provider's request counters,
+/// pace or abandon the retry, and decide whether fallback applies. The caller
+/// has already set `last_error`.
+pub(crate) async fn after_stream_failure(
+    state: &AppState,
+    retry_config: &fallback::RetryConfig,
+    provider: &str,
+    attempt: u32,
+    max_retries: u32,
+    failure: &PreflightFailure,
+) -> FailureAction {
+    state.provider_registry.record_request_end(provider, true);
+
+    let should_fb = fallback::should_fallback(retry_config, &failure.code, failure.status_code);
+
+    if failure.retryable && attempt + 1 < max_retries {
+        if pace_retry(state, retry_config, provider, attempt, failure.retry_after_ms).await {
+            return FailureAction::Retry;
+        }
+    } else {
+        note_retry_after(state, provider, failure.retry_after_ms);
+    }
+
+    if !should_fb {
+        return FailureAction::Respond(error_response(
+            StatusCode::from_u16(failure.status_code.unwrap_or(500))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &failure.code,
+            &failure.message,
+        ));
+    }
+    FailureAction::NextCandidate
 }

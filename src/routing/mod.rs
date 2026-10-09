@@ -18,6 +18,7 @@
 
 pub mod fallback;
 pub mod policy;
+pub mod stream_preflight;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

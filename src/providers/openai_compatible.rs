@@ -6,8 +6,11 @@ use futures::stream;
 use reqwest::Client;
 use url::Url;
 
-use super::{Provider, ProviderOutput};
 use super::events::ProviderEvent;
+use super::key_ring::{
+    DEFAULT_RATE_LIMIT_BENCH, KeyRing, MAX_RATE_LIMIT_BENCH, REJECTED_KEY_BENCH,
+};
+use super::{Provider, ProviderOutput};
 use crate::types::{GatewayRequest, ModelCapabilities, ModelInfo, ProviderConfig, ProviderHealth};
 
 // ─── OpenAI-Compatible Adapter ───────────────────────────────────────────────
@@ -74,6 +77,53 @@ fn error_message_from_body(body: &str) -> String {
     }
 }
 
+/// Turn an in-stream `error` object into `(code, message, http status,
+/// retryable)`. Shapes seen in the wild: OpenAI `{"message","type","code"}`
+/// with a string code, OpenRouter `{"code": 429, "message": ...}` with a
+/// numeric one. The code string matches what the HTTP path produces (the
+/// status number) so `fallback_on` treats both the same way.
+fn classify_stream_error(error: &serde_json::Value) -> (String, String, Option<u16>, bool) {
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| error.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or("Provider reported an error mid-stream")
+        .to_string();
+
+    let status = error
+        .get("code")
+        .and_then(|c| c.as_u64().or_else(|| c.as_str().and_then(|s| s.parse().ok())))
+        .or_else(|| error.get("status").and_then(|s| s.as_u64()))
+        .filter(|s| (400..600).contains(s))
+        .map(|s| s as u16);
+
+    let kind = error
+        .get("type")
+        .and_then(|t| t.as_str())
+        .or_else(|| error.get("code").and_then(|c| c.as_str()))
+        .unwrap_or("stream_error")
+        .to_ascii_lowercase();
+
+    let transient_kind = ["rate_limit", "overloaded", "server_error", "unavailable", "timeout"]
+        .iter()
+        .any(|needle| kind.contains(needle));
+    let retryable = status.is_some_and(|s| s == 429 || s >= 500) || transient_kind;
+    let code = match status {
+        Some(s) => s.to_string(),
+        None if kind.contains("rate_limit") => "rate_limit".to_string(),
+        None => kind,
+    };
+    (code, message, status, retryable)
+}
+
+/// What [`OpenAICompatibleAdapter::send`] hands back.
+struct Sent {
+    response: reqwest::Response,
+    /// Set when every key was rate limited: when the first one is usable again.
+    retry_after_override_ms: Option<u64>,
+}
+
 /// Configuration for an OpenAI-compatible provider instance.
 pub struct OpenAICompatibleAdapter {
     /// Provider name (from config).
@@ -82,8 +132,8 @@ pub struct OpenAICompatibleAdapter {
     base_url: Url,
     /// HTTP client (shared, connection-pooled).
     client: Client,
-    /// API key (resolved from env or config).
-    api_key: Option<String>,
+    /// API keys (resolved from env or config; comma-separated for several).
+    keys: KeyRing,
     /// Default headers for every request.
     default_headers: HashMap<String, String>,
     /// Body fields stripped before sending (`ProviderConfig::drop_params`).
@@ -98,15 +148,18 @@ pub struct OpenAICompatibleAdapter {
 impl OpenAICompatibleAdapter {
     /// Create a new adapter from provider configuration.
     pub fn new(config: &ProviderConfig, capabilities: ModelCapabilities) -> anyhow::Result<Self> {
-        // Resolve API key from env var or direct config.
-        let api_key = config
-            .api_key.clone()
-            .or_else(|| {
-                config
-                    .api_key_env
-                    .as_ref()
-                    .and_then(|env| std::env::var(env).ok())
-            });
+        // Resolve API key(s) from direct config or the named env var. The
+        // value may hold several comma-separated keys (see `KeyRing`).
+        let raw_keys = config.api_key.clone().or_else(|| {
+            config
+                .api_key_env
+                .as_ref()
+                .and_then(|env| std::env::var(env).ok())
+        });
+        let keys = KeyRing::new(raw_keys.as_deref().map(KeyRing::parse).unwrap_or_default());
+        if keys.len() > 1 {
+            tracing::info!(provider = %config.name, keys = keys.len(), "Rotating requests across multiple API keys");
+        }
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -117,7 +170,7 @@ impl OpenAICompatibleAdapter {
             name: config.name.clone(),
             base_url: config.base_url.clone(),
             client,
-            api_key,
+            keys,
             default_headers: config.default_headers.clone().unwrap_or_default(),
             drop_params: config.drop_params.clone(),
             capabilities,
@@ -164,14 +217,21 @@ impl OpenAICompatibleAdapter {
     /// a `.unwrap()` here would panic every single request until the
     /// operator fixed their config, rather than failing that one request
     /// with a clear message.
+    #[cfg(test)]
     fn build_headers(&self) -> anyhow::Result<reqwest::header::HeaderMap> {
+        self.build_headers_with(self.keys.first())
+    }
+
+    /// [`Self::build_headers`] for a specific key (`None` = send no
+    /// `Authorization`).
+    fn build_headers_with(&self, key: Option<&str>) -> anyhow::Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
         );
 
-        if let Some(ref key) = self.api_key {
+        if let Some(key) = key {
             let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", key))
                 .map_err(|e| anyhow::anyhow!("provider '{}' has an invalid api_key (not a valid HTTP header value): {e}", self.name))?;
             headers.insert(reqwest::header::AUTHORIZATION, value);
@@ -187,6 +247,71 @@ impl OpenAICompatibleAdapter {
         }
 
         Ok(headers)
+    }
+
+    /// Send one request, rotating API keys on the way: a `429`/`401`/`403`
+    /// benches the key that was used and the same request is repeated at once
+    /// with the next usable key, so one exhausted or revoked key does not
+    /// surface as a failure while others still work. Only when every key has
+    /// been refused is the last response returned (for a `429`, with
+    /// `retry_after_override_ms` set to when the first key comes back, so the
+    /// provider-level cooldown matches the best key rather than the last
+    /// one tried). With zero or one key this is a plain send.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Sent> {
+        let mut tried: Vec<usize> = Vec::new();
+        let mut handle = self.keys.pick();
+        loop {
+            let headers = self.build_headers_with(handle.as_ref().map(|h| h.key.as_str()))?;
+            let mut request = self.client.request(method.clone(), url).headers(headers);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
+            let status = response.status().as_u16();
+
+            let Some(current) = handle.take() else {
+                return Ok(Sent { response, retry_after_override_ms: None });
+            };
+            if !matches!(status, 401 | 403 | 429) {
+                return Ok(Sent { response, retry_after_override_ms: None });
+            }
+
+            let bench_for = if status == 429 {
+                parse_retry_after_ms(response.headers())
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(DEFAULT_RATE_LIMIT_BENCH)
+                    .min(MAX_RATE_LIMIT_BENCH)
+            } else {
+                REJECTED_KEY_BENCH
+            };
+            self.keys.bench(current.index, bench_for);
+            tried.push(current.index);
+
+            match self.keys.pick_excluding(&tried) {
+                Some(next) => {
+                    tracing::warn!(
+                        provider = %self.name,
+                        status,
+                        key_index = current.index,
+                        next_key_index = next.index,
+                        "Provider refused an API key; retrying the request with the next key"
+                    );
+                    handle = Some(next);
+                }
+                None => {
+                    let retry_after_override_ms = (status == 429 && self.keys.len() > 1)
+                        .then(|| self.keys.all_benched_for())
+                        .flatten()
+                        .map(|d| d.as_millis() as u64);
+                    return Ok(Sent { response, retry_after_override_ms });
+                }
+            }
+        }
     }
 
     /// Build the request body for a chat completion.
@@ -484,14 +609,7 @@ impl Provider for OpenAICompatibleAdapter {
 
     async fn models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = self.endpoint("/v1/models");
-        let headers = self.build_headers()?;
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await?;
+        let response = self.send(reqwest::Method::GET, &url, None).await?.response;
 
         if !response.status().is_success() {
             anyhow::bail!(
@@ -520,21 +638,16 @@ impl Provider for OpenAICompatibleAdapter {
     async fn health(&self) -> ProviderHealth {
         // Try to reach the models endpoint as a health check.
         let url = self.endpoint("/v1/models");
-        let headers = match self.build_headers() {
-            Ok(h) => h,
+        match self.send(reqwest::Method::GET, &url, None).await {
+            Ok(Sent { response, .. }) if response.status().is_success() => ProviderHealth::Healthy,
+            Ok(Sent { response, .. }) if response.status().is_server_error() => ProviderHealth::Unhealthy,
+            Ok(_) => ProviderHealth::Degraded,
             // A malformed api_key genuinely means this provider is
             // misconfigured — Unhealthy is the correct signal, not a panic.
             Err(e) => {
-                tracing::warn!(provider = %self.name, error = %e, "Health check failed: invalid headers");
-                return ProviderHealth::Unhealthy;
+                tracing::debug!(provider = %self.name, error = %e, "Health check request failed");
+                ProviderHealth::Unhealthy
             }
-        };
-
-        match self.client.get(&url).headers(headers).send().await {
-            Ok(resp) if resp.status().is_success() => ProviderHealth::Healthy,
-            Ok(resp) if resp.status().is_server_error() => ProviderHealth::Unhealthy,
-            Ok(_) => ProviderHealth::Degraded,
-            Err(_) => ProviderHealth::Unhealthy,
         }
     }
 
@@ -553,23 +666,16 @@ impl Provider for OpenAICompatibleAdapter {
         } else {
             (self.build_chat_body(request, model), self.endpoint("/v1/chat/completions"))
         };
-        let headers = self.build_headers()?;
-
         let provider_name = self.name.clone();
         let model_name = model.to_string();
 
         // For non-streaming requests, make a simple request/response.
         if !request.stream {
-            let response = self
-                .client
-                .post(&url)
-                .headers(headers)
-                .json(&body)
-                .send()
-                .await?;
+            let Sent { response, retry_after_override_ms } =
+                self.send(reqwest::Method::POST, &url, Some(&body)).await?;
 
             let status = response.status().as_u16();
-            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let retry_after_ms = retry_after_override_ms.or_else(|| parse_retry_after_ms(response.headers()));
 
             if status >= 400 {
                 // Read as text first: an error body is not always JSON
@@ -603,17 +709,12 @@ impl Provider for OpenAICompatibleAdapter {
         // For streaming, we return a Stream that yields ProviderEvents
         // as SSE chunks arrive from the provider.
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        let Sent { response, retry_after_override_ms } =
+            self.send(reqwest::Method::POST, &url, Some(&body)).await?;
 
         let status = response.status().as_u16();
         if status >= 400 {
-            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let retry_after_ms = retry_after_override_ms.or_else(|| parse_retry_after_ms(response.headers()));
             let error_body = response.text().await.unwrap_or_default();
 
             return Ok(ProviderOutput::Complete(ProviderEvent::Error {
@@ -698,6 +799,24 @@ impl Provider for OpenAICompatibleAdapter {
 
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                             let now = Utc::now();
+
+                            // Providers (OpenRouter, notably) report a failure
+                            // that happens after the 200 response started as an
+                            // `{"error": {...}}` data frame. This used to be
+                            // ignored, so the stream just ended empty and looked
+                            // like a successful, blank completion.
+                            if let Some(error) = parsed.get("error").filter(|e| !e.is_null()) {
+                                let (code, message, status_code, retryable) = classify_stream_error(error);
+                                yield ProviderEvent::Error {
+                                    timestamp: now,
+                                    code,
+                                    message,
+                                    status_code,
+                                    retryable,
+                                    retry_after_ms: None,
+                                };
+                                return;
+                            }
 
                             // Iterate every entry in `choices`, not just
                             // index 0 — with `n > 1`, a chunk can carry
@@ -801,13 +920,12 @@ impl Provider for OpenAICompatibleAdapter {
         input: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         let url = self.endpoint("/v1/embeddings");
-        let headers = self.build_headers()?;
         let payload = serde_json::json!({
             "model": model,
             "input": input,
         });
 
-        let resp = self.client.post(&url).headers(headers).json(&payload).send().await?;
+        let resp = self.send(reqwest::Method::POST, &url, Some(&payload)).await?.response;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -923,5 +1041,43 @@ mod retry_after_tests {
         assert_eq!(error_message_from_body("  <html>bad gateway</html> "), "<html>bad gateway</html>");
         assert_eq!(error_message_from_body(""), "Unknown error");
         assert_eq!(error_message_from_body(&"x".repeat(2000)).len(), 500);
+    }
+}
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn numeric_code_becomes_the_http_status_like_the_non_streaming_path() {
+        let (code, message, status, retryable) =
+            classify_stream_error(&json!({"code": 429, "message": "Rate limit exceeded"}));
+        assert_eq!((code.as_str(), status, retryable), ("429", Some(429), true));
+        assert_eq!(message, "Rate limit exceeded");
+    }
+
+    #[test]
+    fn server_errors_are_retryable_and_client_errors_are_not() {
+        assert!(classify_stream_error(&json!({"code": 503, "message": "x"})).3);
+        assert!(!classify_stream_error(&json!({"code": 400, "message": "bad request"})).3);
+    }
+
+    #[test]
+    fn openai_style_string_types_map_to_fallback_codes() {
+        let (code, _, status, retryable) =
+            classify_stream_error(&json!({"type": "rate_limit_error", "message": "slow"}));
+        assert_eq!((code.as_str(), status, retryable), ("rate_limit", None, true));
+
+        let (code, _, _, retryable) = classify_stream_error(&json!({"type": "invalid_request_error", "message": "no"}));
+        assert_eq!((code.as_str(), retryable), ("invalid_request_error", false));
+    }
+
+    #[test]
+    fn string_numeric_codes_and_bare_strings_are_understood() {
+        assert_eq!(classify_stream_error(&json!({"code": "502", "message": "m"})).2, Some(502));
+        let (code, message, status, _) = classify_stream_error(&json!("just text"));
+        assert_eq!((code.as_str(), message.as_str(), status), ("stream_error", "just text", None));
+        assert_eq!(classify_stream_error(&json!({})).1, "Provider reported an error mid-stream");
     }
 }

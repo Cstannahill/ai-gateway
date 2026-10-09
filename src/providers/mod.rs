@@ -6,6 +6,7 @@
 pub mod events;
 pub mod gemini;
 pub mod huggingface;
+pub mod key_ring;
 pub mod llama_cpp;
 pub mod llama_managed;
 pub mod ollama;

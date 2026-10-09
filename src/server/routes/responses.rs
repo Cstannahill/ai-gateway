@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::providers::events::ProviderEvent;
 use crate::providers::ProviderOutput;
 use crate::routing::fallback;
-use crate::server::routes::chat_completions::{note_retry_after, pace_retry, with_gateway_headers};
+use crate::routing::stream_preflight::{Preflight, preflight};
+use crate::server::routes::chat_completions::{
+    FailureAction, after_stream_failure, attempt_status_for_code, note_retry_after, pace_retry, with_gateway_headers,
+};
 use crate::server::AppState;
 use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
 use crate::telemetry::stream_instrumentation::InstrumentedStream;
@@ -249,6 +252,48 @@ pub async fn handle(
                     );
 
                     if stream {
+                        // Same pre-output failover as chat completions: a
+                        // stream that fails or stalls before producing
+                        // anything is a failed attempt, not a broken answer.
+                        let mut instrumented = Box::pin(instrumented);
+                        let mut replay = Vec::new();
+                        if state.config.routing.stream_failover {
+                            let first_token_timeout = state
+                                .config
+                                .routing
+                                .first_token_timeout_secs
+                                .map(std::time::Duration::from_secs);
+                            match preflight(&mut instrumented, first_token_timeout).await {
+                                Preflight::Committed { buffered } => replay = buffered,
+                                Preflight::Failed(failure) => {
+                                    drop(instrumented);
+                                    last_error = Some(failure.message.clone());
+                                    if failure.unrecorded {
+                                        state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
+                                            request_id,
+                                            attempt_number,
+                                            timestamp: Utc::now(),
+                                            status: attempt_status_for_code(&failure.code),
+                                            finish_reason: None,
+                                            provider_response_id: None,
+                                            upstream_provider: None,
+                                            duration_us: (Utc::now() - attempt_started_at)
+                                                .num_microseconds()
+                                                .unwrap_or(0) as u64,
+                                            error_code: Some(failure.code.clone()),
+                                            error_message: Some(failure.message.clone()),
+                                        });
+                                    }
+                                    match after_stream_failure(&state, &retry_config, &candidate.provider, attempt, max_retries, &failure).await {
+                                        FailureAction::Retry => continue,
+                                        FailureAction::NextCandidate => continue 'candidate_loop,
+                                        FailureAction::Respond(response) => return response,
+                                    }
+                                }
+                            }
+                        }
+                        let instrumented = futures::stream::iter(replay).chain(instrumented);
+
                         // Real Responses-API SSE output — previously this
                         // endpoint always collected the full response
                         // server-side and returned one JSON object even when
