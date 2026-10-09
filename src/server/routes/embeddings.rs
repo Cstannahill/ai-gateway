@@ -7,6 +7,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::routing::fallback;
+use crate::server::routes::chat_completions::{pace_retry, with_gateway_headers};
 use crate::server::AppState;
 use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
 use crate::types::Usage;
@@ -198,7 +199,13 @@ pub async fn handle(
                         success: true,
                     });
 
-                    return Json(result).into_response();
+                    return with_gateway_headers(
+                        Json(result).into_response(),
+                        request_id,
+                        &candidate.provider,
+                        &candidate.model,
+                        attempt_number,
+                    );
                 }
                 Ok(Err(e)) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
@@ -218,8 +225,9 @@ pub async fn handle(
                         error_message: last_error.clone(),
                     });
 
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 
@@ -245,8 +253,9 @@ pub async fn handle(
                         error_message: Some(err_msg),
                     });
 
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 

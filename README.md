@@ -2,6 +2,8 @@
 
 <div align="center">
 
+<img src="AI-Gateway.png" alt="AI Gateway" width="128">
+
 **A high-performance personal LLM inference gateway with first-class telemetry, intelligent routing, and multi-provider failover.**
 
 [![Language](https://img.shields.io/badge/language-Rust_2024-orange.svg)](https://www.rust-lang.org/)

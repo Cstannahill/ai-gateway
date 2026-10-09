@@ -51,6 +51,7 @@ async fn discovered_models_have_a_capabilities_object_not_null() {
         degraded_error_rate_threshold: None,
         circuit_breaker_threshold: None,
         circuit_breaker_cooldown_secs: 30,
+        drop_params: Vec::new(),
         enabled: true,
     };
     let adapter: Arc<dyn Provider> =

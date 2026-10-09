@@ -19,6 +19,7 @@ fn test_openai_compatible_provider_options_injection() {
                 degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
+                drop_params: Vec::new(),
         enabled: true,
     };
 
@@ -62,6 +63,7 @@ fn test_generic_openai_options_fallback() {
                 degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
+                drop_params: Vec::new(),
         enabled: true,
     };
 
@@ -102,6 +104,7 @@ fn test_standard_parameters_preserved_with_options() {
                 degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
+                drop_params: Vec::new(),
         enabled: true,
     };
 
@@ -153,6 +156,7 @@ fn test_previously_dropped_fields_are_forwarded() {
                 degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
+                drop_params: Vec::new(),
         enabled: true,
     };
     let adapter = OpenAICompatibleAdapter::new(&config, ModelCapabilities::default()).unwrap();

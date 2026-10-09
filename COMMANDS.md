@@ -154,6 +154,7 @@ Toolchain: Rust edition 2024, Rust 1.88+.
 | `cargo test --test api_tests -- test_health_endpoint` | One test in one file. |
 | `cargo test --lib cli` | Only the CLI parser/help tests. |
 | `cargo clippy --all-targets --offline` | Lint. The project keeps this warning-free. |
+| `node scripts/generate-icons.mjs` | Regenerates every app icon (frontend favicon/manifest/sidebar logo, the exe icon, the gateway's `/favicon.ico`) from `AI-Gateway.png`. Needs `pnpm install` in `frontend/` first (it uses Next.js's bundled `sharp`). |
 | `cargo build --example fake_llama_server` | Builds the fake llama-server used by `tests/llama_server_tests.rs` (the test builds it on demand; you rarely run this yourself). |
 
 ### With a database
@@ -256,6 +257,7 @@ Default base URL `http://127.0.0.1:8999`. Bodies and responses are documented in
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Chat, streaming or not. `model` is an alias or explicit `provider/model`. |
+| `POST` | `/v1/completions` | Raw-prompt completions (editor autocomplete, `suffix` for fill-in-the-middle), forwarded to the provider's own `/v1/completions`. |
 | `POST` | `/v1/responses` | Responses API. |
 | `POST` | `/v1/embeddings` | Embeddings. |
 | `GET` | `/v1/models` | Configured aliases. |
@@ -267,6 +269,7 @@ Default base URL `http://127.0.0.1:8999`. Bodies and responses are documented in
 | `GET` | `/health` | Liveness. |
 | `GET` | `/providers` | Provider health, circuit state, in-flight counts. |
 | `GET` | `/metrics` | Metrics snapshot. |
+| `GET` | `/favicon.ico`, `/icon.png` | The application icon (embedded in the binary). |
 
 **Analytics** (read-only; `503` when no database is configured)
 

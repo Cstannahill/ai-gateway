@@ -57,6 +57,10 @@ struct ProviderRuntimeState {
     /// Fixed-window rate limiter state: the window's start time and how
     /// many attempts have been admitted since. See `is_rate_limited`.
     rate_limit_window: (Instant, u32),
+    /// Set when the provider itself said "come back later" (a `Retry-After`
+    /// on a 429/503 too long to wait out in place). Routing treats it as
+    /// rate-limited until it passes. See `start_cooldown`.
+    cooldown_until: Option<Instant>,
     /// Ring buffer of the last `RECENT_OUTCOMES_CAPACITY` attempt outcomes
     /// (`true` = success), oldest first. Backs `effective_health`'s
     /// error-rate-based `Degraded` override — see that method's doc
@@ -140,6 +144,7 @@ impl ProviderRegistry {
                 circuit_state: CircuitState::Closed,
                 consecutive_failures: 0,
                 rate_limit_window: (Instant::now(), 0),
+                cooldown_until: None,
                 recent_outcomes: std::collections::VecDeque::with_capacity(RECENT_OUTCOMES_CAPACITY),
             },
         );
@@ -214,6 +219,12 @@ impl ProviderRegistry {
         let Some(mut state) = self.state.get_mut(name) else {
             return false;
         };
+        if let Some(until) = state.cooldown_until {
+            if Instant::now() < until {
+                return true;
+            }
+            state.cooldown_until = None;
+        }
         let Some(limit) = state.config.rate_limit_per_sec else {
             return false;
         };
@@ -227,6 +238,26 @@ impl ProviderRegistry {
         }
         state.rate_limit_window.1 += 1;
         false
+    }
+
+    /// Stop routing to `name` for `duration` because the provider itself
+    /// asked for that wait (`Retry-After`). Reported by routing as
+    /// `provider_rate_limited`. Never shortens an existing cooldown.
+    pub fn start_cooldown(&self, name: &str, duration: Duration) {
+        if let Some(mut state) = self.state.get_mut(name) {
+            let until = Instant::now() + duration;
+            if state.cooldown_until.is_none_or(|current| current < until) {
+                state.cooldown_until = Some(until);
+            }
+        }
+    }
+
+    /// Time left on a provider-requested cooldown, if one is active.
+    pub fn cooldown_remaining(&self, name: &str) -> Option<Duration> {
+        let state = self.state.get(name)?;
+        state
+            .cooldown_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
     }
 
     /// Check whether a provider's circuit breaker is currently open (i.e.

@@ -54,6 +54,26 @@ impl Drop for StreamGuard {
     }
 }
 
+/// Which OpenAI endpoint a request arrived on. Both share the whole pipeline
+/// (routing, retry, fallback, telemetry); they differ only in the request
+/// check up front and the shape of the response the client gets back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `POST /v1/chat/completions`
+    Chat,
+    /// `POST /v1/completions` (raw `prompt`, optional `suffix` for FIM)
+    Completion,
+}
+
+impl Kind {
+    fn id_prefix(self) -> &'static str {
+        match self {
+            Kind::Chat => "chatcmpl",
+            Kind::Completion => "cmpl",
+        }
+    }
+}
+
 /// POST /v1/chat/completions
 ///
 /// OpenAI-compatible chat completions endpoint.
@@ -62,6 +82,28 @@ pub async fn handle(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
+) -> Response {
+    dispatch(state, headers, body, Kind::Chat).await
+}
+
+/// POST /v1/completions
+///
+/// OpenAI-compatible legacy completions endpoint — what editor autocomplete
+/// (and fill-in-the-middle via `suffix`) speaks. Forwarded to the provider's
+/// own `/v1/completions`, so no chat template is applied.
+pub async fn handle_completions(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    dispatch(state, headers, body, Kind::Completion).await
+}
+
+async fn dispatch(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+    kind: Kind,
 ) -> Response {
     state.record_gateway_request();
 
@@ -82,7 +124,7 @@ pub async fn handle(
             );
         }
     };
-    let request: GatewayRequest = match serde_json::from_value(raw_value.clone()) {
+    let mut request: GatewayRequest = match serde_json::from_value(raw_value.clone()) {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -92,6 +134,24 @@ pub async fn handle(
             );
         }
     };
+    match kind {
+        Kind::Completion => {
+            if request.prompt.is_none() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Missing required field: prompt",
+                );
+            }
+        }
+        // `prompt`/`suffix` select the completions endpoint inside the
+        // adapters; the chat API defines neither, so a stray one must not
+        // silently turn a chat request into a completions call.
+        Kind::Chat => {
+            request.prompt = None;
+            request.suffix = None;
+        }
+    }
 
     // `request_id` is always gateway-generated (see GatewayRequest's default)
     // and is never overwritten by a client-supplied header — an inbound
@@ -146,7 +206,13 @@ pub async fn handle(
             resolved_model: Some(cached.model.clone()),
             success: true,
         });
-        let mut response = Json(cached.body).into_response();
+        let mut response = with_gateway_headers(
+            Json(cached.body).into_response(),
+            request_id,
+            &cached.provider,
+            &cached.model,
+            0,
+        );
         response.headers_mut().insert("x-cache", "HIT".parse().unwrap());
         return response;
     }
@@ -273,7 +339,7 @@ pub async fn handle(
                     );
 
                     if request.stream {
-                        let chunk_id = format!("chatcmpl-{}", request_id);
+                        let chunk_id = format!("{}-{}", kind.id_prefix(), request_id);
                         let created_ts = received_at.timestamp();
                         let candidate_model = candidate.model.clone();
 
@@ -305,7 +371,12 @@ pub async fn handle(
                                     if matches!(&event, ProviderEvent::Completed { .. }) {
                                         guard.completed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
-                                    event_to_sse(&event, &chunk_id, created_ts, &model_str).map(|data| {
+                                    let data = if kind == Kind::Completion {
+                                        event_to_completion_sse(&event, &chunk_id, created_ts, &model_str)
+                                    } else {
+                                        event_to_sse(&event, &chunk_id, created_ts, &model_str)
+                                    };
+                                    data.map(|data| {
                                         Ok::<_, std::convert::Infallible>(Event::default().data(data))
                                     })
                                 }
@@ -320,9 +391,13 @@ pub async fn handle(
                                 Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
                             }));
 
-                        return Sse::new(sse_stream)
-                            .keep_alive(KeepAlive::default())
-                            .into_response();
+                        return with_gateway_headers(
+                            Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response(),
+                            request_id,
+                            &candidate.provider,
+                            &candidate.model,
+                            attempt_number,
+                        );
                     } else {
                         // Collect stream into a single response. Keyed by
                         // choice `index` so an `n > 1` request's other
@@ -401,23 +476,26 @@ pub async fn handle(
                                 ProviderEvent::Completed { finish_reason: fr, .. } => {
                                     finish_reason = fr;
                                 }
-                                ProviderEvent::Error { code, message, status_code, retryable, .. } => {
-                                    stream_error = Some((code, message, status_code, retryable));
+                                ProviderEvent::Error { code, message, status_code, retryable, retry_after_ms, .. } => {
+                                    stream_error = Some((code, message, status_code, retryable, retry_after_ms));
                                     break;
                                 }
                                 _ => {}
                             }
                         }
 
-                        if let Some((code, message, status_code, retryable)) = stream_error {
+                        if let Some((code, message, status_code, retryable, retry_after_ms)) = stream_error {
                             state.provider_registry.record_request_end(&candidate.provider, true);
                             last_error = Some(message.clone());
 
                             let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
 
                             if retryable && attempt + 1 < max_retries {
-                                tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
-                                continue;
+                                if pace_retry(&state, &retry_config, &candidate.provider, attempt, retry_after_ms).await {
+                                    continue;
+                                }
+                            } else {
+                                note_retry_after(&state, &candidate.provider, retry_after_ms);
                             }
 
                             if !should_fb {
@@ -455,6 +533,14 @@ pub async fn handle(
                         let choices_json: Vec<serde_json::Value> = choices
                             .into_iter()
                             .map(|(index, acc)| {
+                                if kind == Kind::Completion {
+                                    return serde_json::json!({
+                                        "index": index,
+                                        "text": acc.content,
+                                        "logprobs": null,
+                                        "finish_reason": shared_finish_reason,
+                                    });
+                                }
                                 let tool_calls_json: Vec<serde_json::Value> = acc
                                     .tool_calls
                                     .values()
@@ -495,8 +581,8 @@ pub async fn handle(
                             .collect();
 
                         let response = serde_json::json!({
-                            "id": format!("chatcmpl-{}", request_id),
-                            "object": "chat.completion",
+                            "id": format!("{}-{}", kind.id_prefix(), request_id),
+                            "object": if kind == Kind::Completion { "text_completion" } else { "chat.completion" },
                             "created": Utc::now().timestamp(),
                             "model": candidate.model,
                             "choices": choices_json,
@@ -529,7 +615,13 @@ pub async fn handle(
                             success: true,
                         });
 
-                        return Json(response).into_response();
+                        return with_gateway_headers(
+                            Json(response).into_response(),
+                            request_id,
+                            &candidate.provider,
+                            &candidate.model,
+                            attempt_number,
+                        );
                     }
                 }
 
@@ -538,6 +630,7 @@ pub async fn handle(
                     message,
                     status_code,
                     retryable,
+                    retry_after_ms,
                     ..
                 }))) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
@@ -559,8 +652,11 @@ pub async fn handle(
                     let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
 
                     if retryable && attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
-                        continue;
+                        if pace_retry(&state, &retry_config, &candidate.provider, attempt, retry_after_ms).await {
+                            continue;
+                        }
+                    } else {
+                        note_retry_after(&state, &candidate.provider, retry_after_ms);
                     }
 
                     // `should_fb` (derived from `routing.fallback_on`) is the
@@ -623,8 +719,9 @@ pub async fn handle(
                         error_message: last_error.clone(),
                     });
 
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 
@@ -658,8 +755,9 @@ pub async fn handle(
                     });
 
                     let should_fb = fallback::should_fallback(&retry_config, "timeout", Some(504));
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 
@@ -827,6 +925,56 @@ pub fn event_to_sse(event: &ProviderEvent, id: &str, created: i64, model: &str) 
     }
 }
 
+/// The `text_completion` counterpart of [`event_to_sse`]: content arrives as
+/// `choices[].text` instead of `delta.content`, and the chat-only events
+/// (reasoning, tool calls) have no representation, so they are dropped.
+pub fn event_to_completion_sse(event: &ProviderEvent, id: &str, created: i64, model: &str) -> Option<String> {
+    let chunk = |choices: serde_json::Value| {
+        serde_json::json!({
+            "id": id,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": choices,
+        })
+    };
+    let data = match event {
+        ProviderEvent::ContentDelta { index, delta, .. } => chunk(serde_json::json!([{
+            "index": index,
+            "text": delta,
+            "logprobs": null,
+            "finish_reason": null,
+        }])),
+        ProviderEvent::Completed { finish_reason, .. } => chunk(serde_json::json!([{
+            "index": 0,
+            "text": "",
+            "logprobs": null,
+            "finish_reason": finish_reason.as_deref().unwrap_or("stop"),
+        }])),
+        ProviderEvent::UsageUpdate {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            ..
+        } => {
+            let mut data = chunk(serde_json::json!([]));
+            data["usage"] = serde_json::json!({
+                "prompt_tokens": prompt_tokens.unwrap_or(0),
+                "completion_tokens": completion_tokens.unwrap_or(0),
+                "total_tokens": total_tokens.unwrap_or(0),
+            });
+            data
+        }
+        ProviderEvent::Error { code, message, .. } => {
+            let mut data = chunk(serde_json::json!([]));
+            data["error"] = serde_json::json!({ "message": message, "type": code, "code": code });
+            data
+        }
+        _ => return None,
+    };
+    Some(serde_json::to_string(&data).unwrap_or_default())
+}
+
 /// Map a fallback-trigger-style error code to an `AttemptStatus` for
 /// telemetry, mirroring `InstrumentedStream`'s classification so attempts
 /// recorded via the streaming and non-streaming paths use consistent status
@@ -868,4 +1016,75 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+/// Longest provider-requested cooldown honoured by routing, however large the
+/// `Retry-After` was — a bogus `Retry-After: 86400` must not take a provider
+/// out for a day.
+const MAX_PROVIDER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Record a provider's `Retry-After` as a routing cooldown: until it passes,
+/// other requests skip the provider instead of hitting the same 429.
+pub(crate) fn note_retry_after(state: &AppState, provider: &str, retry_after_ms: Option<u64>) {
+    if let Some(ms) = retry_after_ms {
+        let wait = std::time::Duration::from_millis(ms).min(MAX_PROVIDER_COOLDOWN);
+        state.provider_registry.start_cooldown(provider, wait);
+    }
+}
+
+/// Pause before retrying the same provider. Returns `true` after sleeping
+/// (the caller retries in place) and `false` when the provider asked for a
+/// wait longer than `routing.max_retry_after_secs` — the caller then falls
+/// through to fallback, and the provider is cooled down in the registry.
+pub(crate) async fn pace_retry(
+    state: &AppState,
+    retry_config: &fallback::RetryConfig,
+    provider: &str,
+    attempt: u32,
+    retry_after_ms: Option<u64>,
+) -> bool {
+    note_retry_after(state, provider, retry_after_ms);
+    let max_ms = state.config.routing.max_retry_after_secs.saturating_mul(1000);
+    match fallback::backoff_delay(retry_config, attempt, retry_after_ms, max_ms, fallback::jitter_sample()) {
+        fallback::Backoff::Wait(delay) => {
+            tokio::time::sleep(delay).await;
+            true
+        }
+        fallback::Backoff::GiveUp => {
+            tracing::warn!(
+                provider,
+                retry_after_ms,
+                "Provider asked for a wait longer than routing.max_retry_after_secs; falling back instead of retrying"
+            );
+            false
+        }
+    }
+}
+
+/// Stamp a response with where it was served from, so a plain `curl -i` (or a
+/// client's debug log) answers "which provider/model actually ran this, and
+/// how many attempts did it take" without a trip to the analytics API. CORS is
+/// permissive, so browser clients can read these too.
+pub(crate) fn with_gateway_headers(
+    mut response: Response,
+    request_id: Uuid,
+    provider: &str,
+    model: &str,
+    attempts: u32,
+) -> Response {
+    use axum::http::{HeaderName, HeaderValue};
+
+    let headers = response.headers_mut();
+    let mut set = |name: &'static str, value: &str| {
+        // Model IDs can contain characters that are illegal in a header
+        // value; dropping the header beats failing a request that succeeded.
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(HeaderName::from_static(name), value);
+        }
+    };
+    set("x-gateway-request-id", &request_id.to_string());
+    set("x-gateway-provider", provider);
+    set("x-gateway-model", model);
+    set("x-gateway-attempts", &attempts.to_string());
+    response
 }

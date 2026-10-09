@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod assets;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod health;
@@ -19,6 +20,7 @@ use super::AppState;
 pub fn openai_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions::handle))
+        .route("/v1/completions", post(chat_completions::handle_completions))
         .route("/v1/responses", post(responses::handle))
         .route("/v1/embeddings", post(embeddings::handle))
         .route("/v1/models", get(models::handle))
@@ -30,6 +32,8 @@ pub fn management_routes() -> Router<Arc<AppState>> {
         .route("/health", get(health::handle))
         .route("/providers", get(providers::handle))
         .route("/metrics", get(metrics::handle))
+        .route("/favicon.ico", get(assets::favicon))
+        .route("/icon.png", get(assets::icon_png))
 }
 
 /// Read-only analytics query routes over the telemetry schema

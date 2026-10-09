@@ -31,6 +31,17 @@ pub struct GatewayRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
 
+    /// Raw prompt (legacy Completions style, `POST /v1/completions`). A
+    /// string, an array of strings, or token arrays — kept as the client
+    /// sent it. Its presence is what makes a provider adapter dispatch to
+    /// `/v1/completions` instead of `/v1/chat/completions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<serde_json::Value>,
+
+    /// Text that follows the completion (fill-in-the-middle). Completions only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+
     /// Sampling temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -134,6 +145,16 @@ pub struct GatewayRequest {
     /// User-defined metadata for tagging / tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<RequestMetadata>,
+
+    /// Every top-level field the client sent that the canonical schema does
+    /// not model (`logprobs`, `top_logprobs`, `top_k`, `logit_bias`,
+    /// `stream_options`, `store`, ...). Previously discarded silently, so a
+    /// standard OpenAI parameter reached the provider only if the client
+    /// wrapped it in `provider_options`. Adapters forward these after the
+    /// typed fields (never overriding one) and before `provider_options`
+    /// (which wins); a provider's `drop_params` list can strip any of them.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn generate_request_id() -> Uuid {
@@ -167,6 +188,8 @@ impl Default for GatewayRequest {
             model: String::new(),
             messages: None,
             input: None,
+            prompt: None,
+            suffix: None,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -188,6 +211,7 @@ impl Default for GatewayRequest {
             provider_options: None,
             routing: None,
             metadata: None,
+            extra: serde_json::Map::new(),
         }
     }
 }

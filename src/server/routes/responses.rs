@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::providers::events::ProviderEvent;
 use crate::providers::ProviderOutput;
 use crate::routing::fallback;
+use crate::server::routes::chat_completions::{note_retry_after, pace_retry, with_gateway_headers};
 use crate::server::AppState;
 use crate::telemetry::events::{AttemptStatus, TelemetryEvent};
 use crate::telemetry::stream_instrumentation::InstrumentedStream;
@@ -387,9 +388,13 @@ pub async fn handle(
                         .chain(body_stream)
                         .chain(terminal_stream);
 
-                        return Sse::new(sse_stream)
-                            .keep_alive(KeepAlive::default())
-                            .into_response();
+                        return with_gateway_headers(
+                            Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response(),
+                            request_id,
+                            &candidate.provider,
+                            &candidate.model,
+                            attempt_number,
+                        );
                     }
 
                     let mut content = String::new();
@@ -420,23 +425,26 @@ pub async fn handle(
                                     "total_tokens": total_tokens.unwrap_or(0),
                                 }));
                             }
-                            ProviderEvent::Error { code, message, status_code, retryable, .. } => {
-                                stream_err = Some((code, message, status_code, retryable));
+                            ProviderEvent::Error { code, message, status_code, retryable, retry_after_ms, .. } => {
+                                stream_err = Some((code, message, status_code, retryable, retry_after_ms));
                                 break;
                             }
                             _ => {}
                         }
                     }
 
-                    if let Some((code, message, status_code, retryable)) = stream_err {
+                    if let Some((code, message, status_code, retryable, retry_after_ms)) = stream_err {
                         state.provider_registry.record_request_end(&candidate.provider, true);
                         last_error = Some(message.clone());
 
                         let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
 
                         if retryable && attempt + 1 < max_retries {
-                            tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
-                            continue;
+                            if pace_retry(&state, &retry_config, &candidate.provider, attempt, retry_after_ms).await {
+                                continue;
+                            }
+                        } else {
+                            note_retry_after(&state, &candidate.provider, retry_after_ms);
                         }
 
                         if !should_fb {
@@ -490,9 +498,15 @@ pub async fn handle(
                         success: true,
                     });
 
-                    return Json(response).into_response();
+                    return with_gateway_headers(
+                        Json(response).into_response(),
+                        request_id,
+                        &candidate.provider,
+                        &candidate.model,
+                        attempt_number,
+                    );
                 }
-                Ok(Ok(ProviderOutput::Complete(ProviderEvent::Error { code, message, status_code, retryable, .. }))) => {
+                Ok(Ok(ProviderOutput::Complete(ProviderEvent::Error { code, message, status_code, retryable, retry_after_ms, .. }))) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
                     last_error = Some(message.clone());
 
@@ -512,8 +526,11 @@ pub async fn handle(
                     let should_fb = fallback::should_fallback(&retry_config, &code, status_code);
 
                     if retryable && attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
-                        continue;
+                        if pace_retry(&state, &retry_config, &candidate.provider, attempt, retry_after_ms).await {
+                            continue;
+                        }
+                    } else {
+                        note_retry_after(&state, &candidate.provider, retry_after_ms);
                     }
 
                     if !should_fb {
@@ -564,8 +581,9 @@ pub async fn handle(
                         error_message: last_error.clone(),
                     });
 
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 
@@ -598,8 +616,9 @@ pub async fn handle(
                     });
 
                     let should_fb = fallback::should_fallback(&retry_config, "timeout", Some(504));
-                    if attempt + 1 < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    if attempt + 1 < max_retries
+                        && pace_retry(&state, &retry_config, &candidate.provider, attempt, None).await
+                    {
                         continue;
                     }
 

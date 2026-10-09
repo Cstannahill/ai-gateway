@@ -769,7 +769,17 @@ impl Router {
             })
             .unwrap_or(0);
 
-        prompt_chars / 4
+        // A raw completions `prompt` (string, or array of strings; token
+        // arrays carry no text and count as zero) plus any FIM `suffix`.
+        let raw_prompt_chars: u64 = match request.prompt.as_ref() {
+            Some(serde_json::Value::String(s)) => s.len() as u64,
+            Some(serde_json::Value::Array(items)) => {
+                items.iter().filter_map(|v| v.as_str()).map(|s| s.len() as u64).sum()
+            }
+            _ => 0,
+        } + request.suffix.as_ref().map_or(0, |s| s.len() as u64);
+
+        (prompt_chars + raw_prompt_chars) / 4
     }
 
     /// Assumed completion length (tokens) for cost *ranking* purposes when

@@ -83,6 +83,7 @@ fn test_sse_error_envelope() {
         message: "upstream exploded".to_string(),
         status_code: Some(503),
         retryable: true,
+        retry_after_ms: None,
     };
 
     let sse_str = event_to_sse(&event, "chatcmpl-test-err", 1700000000, "test-model").expect("Should format SSE");

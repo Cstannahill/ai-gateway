@@ -288,6 +288,14 @@ pub struct RoutingConfig {
     /// Request timeout in seconds (per attempt).
     #[serde(default = "default_attempt_timeout")]
     pub attempt_timeout_secs: u64,
+
+    /// Longest `Retry-After` the gateway will sit through before retrying the
+    /// same provider. A provider asking for more than this (a free tier
+    /// returning `Retry-After: 3600`) is not retried in place: the request
+    /// falls through to the next candidate, and the provider is skipped by
+    /// routing for the time it asked for.
+    #[serde(default = "default_max_retry_after")]
+    pub max_retry_after_secs: u64,
 }
 
 impl Default for RoutingConfig {
@@ -297,6 +305,7 @@ impl Default for RoutingConfig {
             max_retries_per_provider: default_max_retries(),
             fallback_on: default_fallback_triggers(),
             attempt_timeout_secs: default_attempt_timeout(),
+            max_retry_after_secs: default_max_retry_after(),
         }
     }
 }
@@ -320,6 +329,10 @@ fn default_fallback_triggers() -> Vec<String> {
 
 fn default_attempt_timeout() -> u64 {
     120
+}
+
+fn default_max_retry_after() -> u64 {
+    10
 }
 
 /// Telemetry / data pipeline configuration.

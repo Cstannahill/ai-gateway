@@ -191,9 +191,9 @@ routing:
 
 ### Intra-Provider Retry vs Inter-Provider Fallback
 1. **Intra-Provider Retry**:
-   If an error is retryable (such as transient rate limits or 503) and attempts on this provider are below `max_retries_per_provider`, the gateway performs exponential backoff:
+   If an error is retryable (such as transient rate limits or 503) and attempts on this provider are below `max_retries_per_provider`, the gateway performs exponential backoff with ±20% jitter (capped at 5 s):
    $$\text{delay} = 200\text{ms} \times 2^{\text{attempt}}$$
-   and retries the **same** provider.
+   and retries the **same** provider. If the provider sent `Retry-After` (seconds or HTTP-date) or `retry-after-ms`, the wait is at least that long. A `Retry-After` longer than `routing.max_retry_after_secs` (default 10) is not waited out: the gateway stops retrying that provider and falls through to the next candidate at once. In both cases the provider is put in a cooldown for the time it asked for (max 5 minutes), during which routing skips it with rejection reason `provider_rate_limited` — so a throttled free tier is not retried by every following request. The error `unsupported_endpoint` (e.g. `/v1/completions` on Gemini) always falls through, regardless of `fallback_on`.
 2. **Inter-Provider Fallback**:
    If the error matches `fallback_on` and provider retries are exhausted or non-retryable, the gateway immediately switches to the **next candidate in the plan**.
 

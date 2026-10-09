@@ -979,11 +979,14 @@ small {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
+  flex: none;
+  width: 34px;
   height: 34px;
-  border: 1px solid var(--accent);
-  border-radius: 7px;
-  color: var(--accent);
+}
+.brand-symbol img {
+  display: block;
+  width: 34px;
+  height: 34px;
 }
 .brand small {
   display: block;

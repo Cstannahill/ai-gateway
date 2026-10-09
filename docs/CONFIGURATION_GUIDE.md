@@ -102,6 +102,13 @@ providers:
     # never overrides a real ping-determined "unhealthy". Unset means
     # reported health stays purely the ping result.
     # degraded_error_rate_threshold: 0.5
+    # Request-body fields to remove before sending to this provider. Unknown
+    # top-level fields a client sends (logprobs, top_k, stream_options, ...)
+    # are forwarded to every provider; list the ones a strict provider
+    # rejects here instead of failing every request that carries them.
+    # Also strips typed fields (e.g. parallel_tool_calls) and anything added
+    # through provider_options. Unset means nothing is dropped.
+    # drop_params: [logprobs, top_logprobs, logit_bias]
 
   openrouter:
     name: "openrouter"
@@ -232,6 +239,15 @@ routing:
 
   # Per-attempt upstream network timeout in seconds
   attempt_timeout_secs: 120
+
+  # Longest Retry-After (seconds) the gateway will sit through before
+  # retrying the same provider. A provider answering 429/503 with a
+  # Retry-After (or retry-after-ms) at or below this is waited out (at least
+  # that long, with jittered exponential backoff otherwise); above it the
+  # request falls through to the next candidate immediately and the provider
+  # is skipped by routing ("provider_rate_limited") for the time it asked
+  # for, capped at 5 minutes. 0 = never wait, always fall back. Default: 10.
+  max_retry_after_secs: 10
 
   # Failure conditions that trigger fallback to the next candidate
   fallback_on:

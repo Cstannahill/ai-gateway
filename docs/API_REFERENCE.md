@@ -9,6 +9,7 @@ The **AI Gateway** exposes an OpenAI-compatible HTTP API alongside native monito
 | Endpoint | Method | Purpose | Protocol |
 |:---|:---:|:---|:---|
 | [`/v1/chat/completions`](#1-post-v1chatcompletions) | `POST` | Chat completion inference | JSON or Server-Sent Events (SSE) |
+| [`/v1/completions`](#1a-post-v1completions) | `POST` | Raw-prompt completion (autocomplete / FIM) | JSON or SSE |
 | [`/v1/responses`](#2-post-v1responses) | `POST` | Responses API inference | JSON |
 | [`/v1/embeddings`](#3-post-v1embeddings) | `POST` | Text embedding vector generation | JSON |
 | [`/v1/models`](#4-get-v1models) | `GET` | Catalog of configured & discovered models | JSON |
@@ -36,6 +37,11 @@ Generates chat completions from a logical model alias or explicit provider deplo
 - `x-request-id: <uuid>` *(Optional: client-provided request ID for tracing)*
 
 ### Response Headers
+Every successful chat, completions, responses and embeddings reply carries these (CORS-exposed, so browser clients can read them):
+- `x-gateway-request-id` — the gateway's id for the request (the key for `/v1/analytics/requests/{id}`).
+- `x-gateway-provider` / `x-gateway-model` — the provider and upstream model that actually served it, after alias resolution and any fallback.
+- `x-gateway-attempts` — provider attempts made, retries and fallbacks included (`0` on a cache hit).
+
 - `x-cache: HIT` *(present only when `caching.enabled` is true and this exact non-streaming request matched a live cache entry — see `docs/ROUTING_AND_POLICIES.md`'s caching section. Absent entirely on a miss or when caching is disabled — never sent as `x-cache: MISS`.)*
 
 ### Request Parameters
@@ -81,6 +87,9 @@ Generates chat completions from a logical model alias or explicit provider deplo
   }
 }
 ```
+
+### Parameters not listed above
+Any other top-level field is **forwarded to the provider unchanged** (`logprobs`, `top_logprobs`, `top_k`, `logit_bias`, `stream_options`, `store`, ...), so standard OpenAI parameters work without wrapping them in `provider_options`. Precedence, lowest to highest: typed fields above → forwarded fields (never replace a typed field) → `provider_options` for the serving provider → the provider's `drop_params` list, which removes fields a strict provider rejects (see `docs/CONFIGURATION_GUIDE.md`). The unmodified body is still what telemetry stores as `raw_request`.
 
 ### Response (Non-Streaming: `stream: false`)
 ```json
@@ -134,6 +143,42 @@ curl -X POST http://localhost:8999/v1/chat/completions \
     "stream": true
   }'
 ```
+
+---
+
+## 1a. POST `/v1/completions`
+
+Legacy raw-prompt completions — what editor autocomplete tools (Continue, llama.vim, ...) speak, including fill-in-the-middle through `suffix`. The request goes to the serving provider's **own** `/v1/completions`, so no chat template is applied. Routing, retry, fallback, telemetry and the `x-gateway-*` response headers are identical to chat.
+
+```json
+{
+  "model": "llama/qwen2.5-coder-1.5b",
+  "prompt": "def add(a, b):",
+  "suffix": "\nprint(add(1, 2))",
+  "max_tokens": 32,
+  "temperature": 0,
+  "stream": false
+}
+```
+
+`prompt` is required (string, array of strings or token arrays — passed through as sent); `400 invalid_request_error` otherwise. Mapped fields: `suffix`, `temperature`, `top_p`, `max_tokens` (or `max_completion_tokens`), `stop`, `n`, `frequency_penalty`, `presence_penalty`, `seed`, `user`, `stream`. Everything else (`best_of`, `echo`, `top_k`, ...) is forwarded like any unknown field.
+
+Response (`object: "text_completion"`, ids prefixed `cmpl-`):
+
+```json
+{
+  "id": "cmpl-01921a4f-5b68-7182-938b-829d10e01234",
+  "object": "text_completion",
+  "created": 1790000000,
+  "model": "qwen2.5-coder-1.5b",
+  "choices": [{ "index": 0, "text": "\n    return a + b", "logprobs": null, "finish_reason": "stop" }],
+  "usage": { "prompt_tokens": 9, "completion_tokens": 6, "total_tokens": 15 }
+}
+```
+
+Streaming sends `text_completion` chunks (`choices[].text`), a final chunk with `finish_reason`, a usage chunk, then `[DONE]`.
+
+Limits: `logprobs` are forwarded to the provider but not copied into the gateway's reply; providers without a `/v1/completions` (Gemini's OpenAI layer) answer `unsupported_endpoint`, which routing always treats as fall-through-to-next-candidate. A chat request containing `prompt`/`suffix` never becomes a completion — those two fields are ignored on `/v1/chat/completions`.
 
 ---
 
@@ -695,6 +740,10 @@ When an error occurs, the gateway returns standard OpenAI-compatible error paylo
 | `504` | `gateway_timeout` | The candidate attempt exceeded `attempt_timeout_secs` |
 
 ---
+
+### Application icon
+
+`GET /favicon.ico` (multi-size `.ico`) and `GET /icon.png` (256x256) serve the AI Gateway icon, embedded in the binary, so a browser tab pointed at the gateway shows the logo. No authentication, cacheable for a day.
 
 ## 16. `/llama-server/*` — llama-server management
 

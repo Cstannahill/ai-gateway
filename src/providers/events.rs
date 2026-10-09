@@ -113,6 +113,10 @@ pub enum ProviderEvent {
         status_code: Option<u16>,
         /// Whether this error is retryable.
         retryable: bool,
+        /// How long the provider asked us to wait before retrying
+        /// (`Retry-After` / `retry-after-ms`), in milliseconds.
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
     },
 
     // ─── Non-streaming results ───────────────────────────────────────────

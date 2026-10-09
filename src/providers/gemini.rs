@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use super::openai_compatible::OpenAICompatibleAdapter;
+use super::events::ProviderEvent;
 use super::{Provider, ProviderOutput};
 use crate::types::{GatewayRequest, ModelCapabilities, ModelInfo, ProviderConfig, ProviderHealth};
 
@@ -77,6 +78,19 @@ impl Provider for GeminiAdapter {
         request: &GatewayRequest,
         model: &str,
     ) -> anyhow::Result<ProviderOutput> {
+        // Gemini's OpenAI-compatibility layer has no legacy /completions
+        // endpoint. Say so plainly (and let routing fall through to the next
+        // candidate) instead of forwarding a request that can only 404.
+        if request.prompt.is_some() {
+            return Ok(ProviderOutput::Complete(ProviderEvent::Error {
+                timestamp: chrono::Utc::now(),
+                code: "unsupported_endpoint".to_string(),
+                message: "Gemini does not provide /v1/completions; use /v1/chat/completions".to_string(),
+                status_code: Some(400),
+                retryable: false,
+                retry_after_ms: None,
+            }));
+        }
         let enriched = self.enrich_request(request);
         self.inner.execute(&enriched, model).await
     }

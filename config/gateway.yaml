@@ -125,6 +125,7 @@ routing:
     - unavailable
     - server_error
   attempt_timeout_secs: 120
+  max_retry_after_secs: 10 # longer Retry-After => fall back at once and skip that provider for the wait
 
 # ─── Telemetry ──────────────────────────────────────────────────────────────
 

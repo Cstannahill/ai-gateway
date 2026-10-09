@@ -91,6 +91,7 @@ fn test_endpoint_normalization() {
                 degraded_error_rate_threshold: None,
                 circuit_breaker_threshold: None,
                 circuit_breaker_cooldown_secs: 30,
+                drop_params: Vec::new(),
             enabled: true,
         };
         OpenAICompatibleAdapter::new(&config, ModelCapabilities::default()).unwrap()

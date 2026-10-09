@@ -31,6 +31,49 @@ fn is_version_segment(segment: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
+/// The wait a provider asked for on a throttled/unavailable response, in
+/// milliseconds. Understands `retry-after-ms` (used by OpenAI and several
+/// compatible servers), and `Retry-After` as either delta-seconds or an
+/// HTTP-date. `None` when absent or unparseable.
+pub fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        && ms >= 0.0
+    {
+        return Some(ms as u64);
+    }
+
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = value.parse::<f64>() {
+        return (secs >= 0.0).then_some((secs * 1000.0) as u64);
+    }
+    // HTTP-date (RFC 7231 IMF-fixdate is a subset of RFC 2822).
+    let when = DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = when.with_timezone(&Utc) - Utc::now();
+    Some(delta.num_milliseconds().max(0) as u64)
+}
+
+/// Best-effort human message from a provider error body: the OpenAI-style
+/// `error.message` (or a bare `error` string / `message`) when the body is
+/// JSON, otherwise the raw text trimmed to a sane length.
+fn error_message_from_body(body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let from_json = parsed.as_ref().and_then(|v| {
+        v.get("error")
+            .and_then(|e| e.get("message").or(Some(e)))
+            .and_then(|m| m.as_str())
+            .or_else(|| v.get("message").and_then(|m| m.as_str()))
+            .map(str::to_string)
+    });
+    match from_json {
+        Some(message) if !message.is_empty() => message,
+        _ if body.trim().is_empty() => "Unknown error".to_string(),
+        _ => body.trim().chars().take(500).collect(),
+    }
+}
+
 /// Configuration for an OpenAI-compatible provider instance.
 pub struct OpenAICompatibleAdapter {
     /// Provider name (from config).
@@ -43,6 +86,8 @@ pub struct OpenAICompatibleAdapter {
     api_key: Option<String>,
     /// Default headers for every request.
     default_headers: HashMap<String, String>,
+    /// Body fields stripped before sending (`ProviderConfig::drop_params`).
+    drop_params: Vec<String>,
     /// Known capabilities.
     capabilities: ModelCapabilities,
     /// Request timeout.
@@ -74,6 +119,7 @@ impl OpenAICompatibleAdapter {
             client,
             api_key,
             default_headers: config.default_headers.clone().unwrap_or_default(),
+            drop_params: config.drop_params.clone(),
             capabilities,
             timeout: std::time::Duration::from_secs(config.timeout_secs),
         })
@@ -241,6 +287,68 @@ impl OpenAICompatibleAdapter {
             body["user"] = serde_json::json!(user);
         }
 
+        self.finish_body(body, request)
+    }
+
+    /// Build the request body for a raw-prompt completion
+    /// (`POST /v1/completions`). Only the parameters that endpoint defines
+    /// are mapped from the typed request; everything else the client sent
+    /// (`best_of`, `echo`, `logprobs`, `top_k`, ...) rides in `extra`.
+    pub fn build_completion_body(&self, request: &GatewayRequest, model: &str) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": model,
+            "stream": request.stream,
+        });
+        if let Some(ref prompt) = request.prompt {
+            body["prompt"] = prompt.clone();
+        }
+        if let Some(ref suffix) = request.suffix {
+            body["suffix"] = serde_json::json!(suffix);
+        }
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if let Some(max) = request.max_tokens.or(request.max_completion_tokens) {
+            body["max_tokens"] = serde_json::json!(max);
+        }
+        if let Some(ref stop) = request.stop {
+            body["stop"] = serde_json::to_value(stop).unwrap_or_default();
+        }
+        if let Some(n) = request.n {
+            body["n"] = serde_json::json!(n);
+        }
+        if let Some(fp) = request.frequency_penalty {
+            body["frequency_penalty"] = serde_json::json!(fp);
+        }
+        if let Some(pp) = request.presence_penalty {
+            body["presence_penalty"] = serde_json::json!(pp);
+        }
+        if let Some(seed) = request.seed {
+            body["seed"] = serde_json::json!(seed);
+        }
+        if let Some(ref user) = request.user {
+            body["user"] = serde_json::json!(user);
+        }
+        self.finish_body(body, request)
+    }
+
+    /// Shared tail of both body builders, in increasing precedence:
+    /// 1. `request.extra` — unmodelled top-level client fields; never
+    ///    replaces a field the typed mapping already set.
+    /// 2. `provider_options` for this provider — the explicit escape hatch,
+    ///    replaces anything above.
+    /// 3. `drop_params` — the operator's per-provider strip list, applied
+    ///    last so it also removes anything the two steps above added.
+    fn finish_body(&self, mut body: serde_json::Value, request: &GatewayRequest) -> serde_json::Value {
+        for (key, value) in &request.extra {
+            if body.get(key).is_none() {
+                body[key] = value.clone();
+            }
+        }
+
         // ─── Provider options escape hatch ──────────────────────────────
         if let Some(ref opts) = request.provider_options {
             for (key, val) in opts {
@@ -251,6 +359,12 @@ impl OpenAICompatibleAdapter {
                         body[param_k] = param_v.clone();
                     }
                 }
+            }
+        }
+
+        if let Some(obj) = body.as_object_mut() {
+            for key in &self.drop_params {
+                obj.remove(key);
             }
         }
 
@@ -302,7 +416,12 @@ impl OpenAICompatibleAdapter {
             let choice_index = choice["index"].as_u64().unwrap_or(choice_idx as u64) as u32;
             let message = &choice["message"];
 
-            let content = message["content"].as_str().unwrap_or_default().to_string();
+            // Chat responses carry `message.content`; legacy completions carry `text`.
+            let content = message["content"]
+                .as_str()
+                .or_else(|| choice["text"].as_str())
+                .unwrap_or_default()
+                .to_string();
             if !content.is_empty() {
                 events.push(ProviderEvent::ContentDelta {
                     timestamp: Utc::now(),
@@ -425,8 +544,15 @@ impl Provider for OpenAICompatibleAdapter {
         model: &str,
     ) -> anyhow::Result<ProviderOutput> {
         let started = Utc::now();
-        let body = self.build_chat_body(request, model);
-        let url = self.endpoint("/v1/chat/completions");
+        // A raw `prompt` (and no chat messages) means a `/v1/completions`
+        // request; everything downstream of the HTTP call is shared because
+        // the event model is the same (`choices[].text` ≙ `delta.content`).
+        let is_completion = request.prompt.is_some();
+        let (body, url) = if is_completion {
+            (self.build_completion_body(request, model), self.endpoint("/v1/completions"))
+        } else {
+            (self.build_chat_body(request, model), self.endpoint("/v1/chat/completions"))
+        };
         let headers = self.build_headers()?;
 
         let provider_name = self.name.clone();
@@ -443,22 +569,25 @@ impl Provider for OpenAICompatibleAdapter {
                 .await?;
 
             let status = response.status().as_u16();
-            let response_body: serde_json::Value = response.json().await?;
+            let retry_after_ms = parse_retry_after_ms(response.headers());
 
             if status >= 400 {
+                // Read as text first: an error body is not always JSON
+                // (proxies and gateways in front of a provider return
+                // HTML or plain text), and failing to parse it used to turn
+                // a clean 429/503 into an opaque transport error.
+                let error_body = response.text().await.unwrap_or_default();
                 return Ok(ProviderOutput::Complete(ProviderEvent::Error {
                     timestamp: Utc::now(),
                     code: status.to_string(),
-                    message: response_body
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error")
-                        .to_string(),
+                    message: error_message_from_body(&error_body),
                     status_code: Some(status),
                     retryable: status == 429 || status >= 500,
+                    retry_after_ms,
                 }));
             }
+
+            let response_body: serde_json::Value = response.json().await?;
 
             let events = Self::events_from_non_streaming_response(
                 &response_body,
@@ -484,23 +613,16 @@ impl Provider for OpenAICompatibleAdapter {
 
         let status = response.status().as_u16();
         if status >= 400 {
+            let retry_after_ms = parse_retry_after_ms(response.headers());
             let error_body = response.text().await.unwrap_or_default();
-            let error_msg = serde_json::from_str::<serde_json::Value>(&error_body)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or(error_body);
 
             return Ok(ProviderOutput::Complete(ProviderEvent::Error {
                 timestamp: Utc::now(),
                 code: status.to_string(),
-                message: error_msg,
+                message: error_message_from_body(&error_body),
                 status_code: Some(status),
                 retryable: status == 429 || status >= 500,
+                retry_after_ms,
             }));
         }
 
@@ -539,6 +661,7 @@ impl Provider for OpenAICompatibleAdapter {
                             message: e.to_string(),
                             status_code: None,
                             retryable: false,
+                            retry_after_ms: None,
                         };
                         return;
                     }
@@ -591,7 +714,8 @@ impl Provider for OpenAICompatibleAdapter {
                                     let choice_index = choice["index"].as_u64().unwrap_or(0) as u32;
                                     let delta = &choice["delta"];
 
-                                    if let Some(delta_content) = delta["content"].as_str()
+                                    if let Some(delta_content) =
+                                        delta["content"].as_str().or_else(|| choice["text"].as_str())
                                         && !delta_content.is_empty()
                                     {
                                         yield ProviderEvent::ContentDelta {
@@ -714,6 +838,7 @@ mod tests {
             degraded_error_rate_threshold: None,
             circuit_breaker_threshold: None,
             circuit_breaker_cooldown_secs: 30,
+            drop_params: Vec::new(),
             enabled: true,
         }
     }
@@ -744,5 +869,59 @@ mod tests {
     fn build_headers_succeeds_with_no_api_key() {
         let adapter = OpenAICompatibleAdapter::new(&config_with_api_key(None), ModelCapabilities::default()).unwrap();
         assert!(adapter.build_headers().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn delta_seconds() {
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", "7")])), Some(7_000));
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", " 1.5 ")])), Some(1_500));
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", "0")])), Some(0));
+    }
+
+    #[test]
+    fn milliseconds_header_wins() {
+        let h = headers(&[("retry-after", "7"), ("retry-after-ms", "250")]);
+        assert_eq!(parse_retry_after_ms(&h), Some(250));
+    }
+
+    #[test]
+    fn http_date_in_the_future_and_in_the_past() {
+        let future = (Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        let ms = parse_retry_after_ms(&headers(&[("retry-after", &future)])).unwrap();
+        assert!((25_000..=31_000).contains(&ms), "{ms}");
+
+        let past = (Utc::now() - chrono::Duration::seconds(30)).to_rfc2822();
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", &past)])), Some(0));
+    }
+
+    #[test]
+    fn garbage_negative_and_absent_are_none() {
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", "soon")])), None);
+        assert_eq!(parse_retry_after_ms(&headers(&[("retry-after", "-3")])), None);
+        assert_eq!(parse_retry_after_ms(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn error_messages_come_from_the_best_available_field() {
+        assert_eq!(error_message_from_body(r#"{"error":{"message":"nope"}}"#), "nope");
+        assert_eq!(error_message_from_body(r#"{"error":"flat string"}"#), "flat string");
+        assert_eq!(error_message_from_body(r#"{"message":"top level"}"#), "top level");
+        assert_eq!(error_message_from_body("  <html>bad gateway</html> "), "<html>bad gateway</html>");
+        assert_eq!(error_message_from_body(""), "Unknown error");
+        assert_eq!(error_message_from_body(&"x".repeat(2000)).len(), 500);
     }
 }

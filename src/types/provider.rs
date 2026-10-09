@@ -106,6 +106,16 @@ pub struct ProviderConfig {
     #[serde(default = "default_circuit_breaker_cooldown_secs")]
     pub circuit_breaker_cooldown_secs: u64,
 
+    /// Request-body fields removed before the request is sent to this
+    /// provider. Unknown top-level request fields are forwarded to every
+    /// provider (see `GatewayRequest::extra`); a provider that rejects some
+    /// of them (a strict OpenAI-compatibility layer such as Gemini's) lists
+    /// them here instead of failing every request that carries one. Applies
+    /// to typed fields too (e.g. `parallel_tool_calls`), and runs last, so
+    /// it also strips anything injected via `provider_options`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_params: Vec<String>,
+
     /// Whether this provider is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,

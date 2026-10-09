@@ -64,6 +64,7 @@ fn create_provider_config(name: &str, enabled: bool) -> ProviderConfig {
                 degraded_error_rate_threshold: None,
         circuit_breaker_threshold: None,
         circuit_breaker_cooldown_secs: 30,
+        drop_params: Vec::new(),
         enabled,
     }
 }

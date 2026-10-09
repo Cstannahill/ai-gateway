@@ -92,6 +92,7 @@ impl Provider for ProbeProvider {
             message: "audit failure".into(),
             status_code: Some(503),
             retryable: true,
+            retry_after_ms: None,
         };
         if self.mode == 1 {
             return Ok(ProviderOutput::Complete(error));

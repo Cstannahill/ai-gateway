@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState, type ReactNode } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
@@ -153,7 +154,14 @@ function Shell({
       <aside className={"sidebar " + (mobile ? "mobile-open" : "")}>
         <Link className="brand" href={href("overview")}>
           <span className="brand-symbol">
-            <Activity size={21} />
+            <Image
+              src="/icons/ai-gateway-128.png"
+              alt=""
+              width={34}
+              height={34}
+              unoptimized
+              priority
+            />
           </span>
           <span>
             AI Gateway<small>OBSERVABILITY</small>
