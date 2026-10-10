@@ -24,6 +24,7 @@
 //
 // The database is NOT in the stream's critical path.
 
+pub mod cost;
 pub mod events;
 pub mod health;
 pub mod stream_instrumentation;

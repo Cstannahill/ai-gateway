@@ -420,6 +420,9 @@ async fn dispatch(
                                     if matches!(&event, ProviderEvent::Completed { .. }) {
                                         guard.completed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
+                                    if let ProviderEvent::UsageUpdate { raw_usage, .. } = &event {
+                                        guard.state.record_provider_cost(&guard.provider, raw_usage);
+                                    }
                                     let data = if kind == Kind::Completion {
                                         event_to_completion_sse(&event, &chunk_id, created_ts, &model_str)
                                     } else {
@@ -509,8 +512,10 @@ async fn dispatch(
                                     total_tokens,
                                     cached_tokens,
                                     reasoning_tokens,
+                                    raw_usage,
                                     ..
                                 } => {
+                                    state.record_provider_cost(&candidate.provider, &raw_usage);
                                     // Previously dropped cached/reasoning
                                     // token detail even when the provider
                                     // reported it (Audit A08).

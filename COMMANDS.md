@@ -271,6 +271,7 @@ Default base URL `http://127.0.0.1:8999`. Bodies and responses are documented in
 | `GET` | `/health` | Liveness. |
 | `GET` | `/providers` | Provider health, circuit state, in-flight counts. |
 | `GET` | `/metrics` | Metrics snapshot. |
+| `GET` | `/metrics/prometheus` | The same live numbers in Prometheus text format (loopback Host, no browser Origin). |
 | `GET` | `/favicon.ico`, `/icon.png` | The application icon (embedded in the binary). |
 | `POST` | `/admin/reload` | Re-read `gateway.yaml` and the env file and apply them without a restart (see below). Loopback callers only; refused for browser origins. |
 | `GET` | `/admin/reload` | Reload status: watched files, reloads applied, outcome of the last attempt. |

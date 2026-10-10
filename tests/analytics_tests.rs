@@ -1643,3 +1643,101 @@ async fn analytics_usage_canonical_flags_single_duplicate_and_conflicting_observ
     assert_eq!(a3["prompt_tokens"], 300);
     assert_eq!(a3["completion_tokens"], 120);
 }
+
+#[tokio::test]
+async fn analytics_costs_reports_provider_reported_cost_separately_from_the_estimate() {
+    let Ok(url) = std::env::var("AUDIT_DATABASE_URL") else {
+        eprintln!("skipping analytics_costs_reports_provider_reported_cost_separately_from_the_estimate: AUDIT_DATABASE_URL not set");
+        return;
+    };
+
+    let run_id = Uuid::now_v7();
+    let provider = format!("reporting-provider-{run_id}");
+    let model = format!("reporting-model-{run_id}");
+
+    // No pricing at all: the only cost information is what the provider says.
+    let writer = TelemetryWriter::new_with_fallback_log(&url, 2, 100, 60_000, true, true, "telemetry_fallback.jsonl", HashMap::new())
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut events = Vec::new();
+    for cost in [0.01, 0.02] {
+        let request_id = Uuid::now_v7();
+        events.push(TelemetryEvent::RequestReceived {
+            request_id,
+            timestamp: Utc::now(),
+            client_correlation_id: None,
+            application: None,
+            task: None,
+            tags: vec![],
+            requested_model: model.clone(),
+            streaming: false,
+            canonical_messages: None,
+            raw_request: None,
+            uses_tools: false,
+            uses_vision: false,
+            uses_structured_output: false,
+            uses_reasoning: false,
+        });
+        events.push(TelemetryEvent::ProviderAttemptStarted {
+            request_id,
+            attempt_number: 1,
+            timestamp: Utc::now(),
+            provider: provider.clone(),
+            model: model.clone(),
+        });
+        events.push(TelemetryEvent::UsageRecorded {
+            request_id,
+            attempt_number: 1,
+            timestamp: Utc::now(),
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cached_tokens: None,
+                reasoning_tokens: None,
+                raw_provider_usage: Some(serde_json::json!({"cost": cost})),
+            },
+            source: "stream_final".to_string(),
+            kind: "cumulative".to_string(),
+        });
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(200);
+    for e in events {
+        tx.send(e).await.unwrap();
+    }
+    drop(tx);
+    writer.run(rx).await;
+
+    let state = Arc::new(AppState {
+        config: GatewayConfig::load(None).unwrap().into(),
+        model_registry: ModelRegistry::new(HashMap::new()),
+        provider_registry: ProviderRegistry::new(),
+        router: RoutingEngine::new("priority".to_string()),
+        telemetry_tx: tokio::sync::mpsc::channel(1).0,
+        start_time: Instant::now(),
+        total_gateway_requests: std::sync::atomic::AtomicU64::new(0),
+        telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
+        response_cache: None,
+        llama_server: None,
+        reloader: None,
+        analytics_pool: Some(pool),
+    });
+
+    let (status, body) = get(state, &format!("/v1/analytics/costs?provider={provider}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["reported_attempts"], 2);
+    let reported = body["reported_cost"].as_f64().unwrap();
+    assert!((reported - 0.03).abs() < 1e-9, "got {reported}");
+    // Nothing is priced: the estimate stays absent rather than becoming zero.
+    assert_eq!(body["priced_attempts"], 0);
+    assert_eq!(body["estimated_token_charge"], serde_json::Value::Null);
+    // And a per-response figure is still not an invoice.
+    assert_eq!(body["billed_cost"], serde_json::Value::Null);
+
+    let breakdown = &body["breakdowns"].as_array().unwrap()[0];
+    assert_eq!(breakdown["provider"], provider.as_str());
+    assert_eq!(breakdown["reported_attempts"], 2);
+    assert!((breakdown["reported_cost"].as_f64().unwrap() - 0.03).abs() < 1e-9);
+}

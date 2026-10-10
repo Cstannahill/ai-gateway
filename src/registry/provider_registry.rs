@@ -48,6 +48,11 @@ struct ProviderRuntimeState {
     /// Inference-attempt latency only — see `record_latency`'s doc comment.
     total_latency_ms: u64,
     latency_samples: u64,
+    /// Per-bucket (non-cumulative) counts of inference latency, bounds in
+    /// [`LATENCY_BUCKETS_MS`]; the last slot is the overflow (`+Inf`) bucket.
+    latency_buckets: [u64; LATENCY_BUCKETS_MS.len() + 1],
+    /// Sum of the cost providers reported for requests served here (USD).
+    reported_cost_usd: f64,
     /// Background health-probe latency only — see
     /// `record_health_check_latency`'s doc comment.
     total_health_check_latency_ms: u64,
@@ -80,6 +85,8 @@ impl ProviderRuntimeState {
             total_errors: 0,
             total_latency_ms: 0,
             latency_samples: 0,
+            latency_buckets: [0; LATENCY_BUCKETS_MS.len() + 1],
+            reported_cost_usd: 0.0,
             total_health_check_latency_ms: 0,
             health_check_latency_samples: 0,
             circuit_state: CircuitState::Closed,
@@ -89,6 +96,22 @@ impl ProviderRuntimeState {
             recent_outcomes: std::collections::VecDeque::with_capacity(RECENT_OUTCOMES_CAPACITY),
         }
     }
+}
+
+/// Upper bounds (ms) of the inference-latency histogram buckets.
+pub const LATENCY_BUCKETS_MS: [u64; 12] =
+    [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000];
+
+/// See [`ProviderRegistry::metrics_snapshot`].
+#[derive(Debug, Clone)]
+pub struct ProviderMetrics {
+    pub name: String,
+    /// Non-cumulative counts per [`LATENCY_BUCKETS_MS`] bound, plus overflow.
+    pub latency_buckets: Vec<u64>,
+    pub latency_sum_ms: u64,
+    pub latency_count: u64,
+    pub reported_cost_usd: f64,
+    pub cooling_down: bool,
 }
 
 /// What [`ProviderRegistry::reconcile`] did.
@@ -459,6 +482,11 @@ impl ProviderRegistry {
         if let Some(mut state) = self.state.get_mut(name) {
             state.total_latency_ms += latency_ms;
             state.latency_samples += 1;
+            let bucket = LATENCY_BUCKETS_MS
+                .iter()
+                .position(|bound| latency_ms <= *bound)
+                .unwrap_or(LATENCY_BUCKETS_MS.len());
+            state.latency_buckets[bucket] += 1;
         }
     }
 
@@ -475,6 +503,35 @@ impl ProviderRegistry {
     }
 
     /// Get status for all providers (for /providers endpoint).
+    /// Add the cost a provider reported for one request (USD).
+    pub fn record_reported_cost(&self, name: &str, usd: f64) {
+        if usd.is_finite()
+            && usd >= 0.0
+            && let Some(mut state) = self.state.get_mut(name)
+        {
+            state.reported_cost_usd += usd;
+        }
+    }
+
+    /// Per-provider figures for the Prometheus endpoint that `ProviderStatus`
+    /// (the JSON shape) does not carry.
+    pub fn metrics_snapshot(&self) -> Vec<ProviderMetrics> {
+        self.state
+            .iter()
+            .map(|entry| {
+                let s = entry.value();
+                ProviderMetrics {
+                    name: entry.key().clone(),
+                    latency_buckets: s.latency_buckets.to_vec(),
+                    latency_sum_ms: s.total_latency_ms,
+                    latency_count: s.latency_samples,
+                    reported_cost_usd: s.reported_cost_usd,
+                    cooling_down: s.cooldown_until.is_some_and(|until| until > Instant::now()),
+                }
+            })
+            .collect()
+    }
+
     pub fn all_statuses(&self) -> Vec<ProviderStatus> {
         self.state
             .iter()

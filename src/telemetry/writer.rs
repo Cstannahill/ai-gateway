@@ -831,11 +831,18 @@ impl TelemetryWriter {
                     .await?;
                 }
 
-                // Compute and persist cost if this attempt's provider/model
-                // has a configured price — previously `cost_records` had no
-                // producer at all regardless of configuration
-                // (docs/REMEDIATION_PLAN.md Phase 3.5 / Audit A15/A17).
-                if !self.pricing.is_empty() {
+                // Persist cost for this attempt: the estimate from a
+                // configured price (previously `cost_records` had no producer
+                // at all regardless of configuration - Phase 3.5 / Audit
+                // A15/A17), and/or the cost the provider itself reported in
+                // its usage object (OpenRouter's `usage.cost`), in one row so
+                // estimated and actual sit side by side. No price and no
+                // reported cost means no row - never a fabricated zero.
+                let reported_cost = usage
+                    .raw_provider_usage
+                    .as_ref()
+                    .and_then(crate::telemetry::cost::reported_cost_usd);
+                if !self.pricing.is_empty() || reported_cost.is_some() {
                     let deployment: Option<(String, String)> = sqlx::query_as(
                         r#"SELECT provider, model FROM provider_attempts WHERE request_id = $1 AND attempt_number = $2"#,
                     )
@@ -844,23 +851,30 @@ impl TelemetryWriter {
                     .fetch_optional(&mut **tx)
                     .await?;
 
-                    if let Some((provider, model)) = deployment
-                        && let Some(price) = self.pricing.get(&format!("{provider}/{model}"))
-                    {
-                        let input_cost = (usage.prompt_tokens as f64 / 1000.0) * price.input_cost_per_1k;
-                        let output_cost = (usage.completion_tokens as f64 / 1000.0) * price.output_cost_per_1k;
+                    let (provider, model) = match &deployment {
+                        Some((p, m)) => (Some(p.clone()), Some(m.clone())),
+                        None => (None, None),
+                    };
+                    let price = deployment
+                        .as_ref()
+                        .and_then(|(p, m)| self.pricing.get(&format!("{p}/{m}")));
+                    let input_cost = price.map(|p| (usage.prompt_tokens as f64 / 1000.0) * p.input_cost_per_1k);
+                    let output_cost = price.map(|p| (usage.completion_tokens as f64 / 1000.0) * p.output_cost_per_1k);
+                    let estimated_cost = input_cost.zip(output_cost).map(|(i, o)| i + o);
 
+                    if estimated_cost.is_some() || reported_cost.is_some() {
                         sqlx::query(
                             r#"
                             INSERT INTO cost_records (
-                                request_id, timestamp, estimated_cost, currency, provider, model,
+                                request_id, timestamp, estimated_cost, actual_cost, currency, provider, model,
                                 input_cost, output_cost
-                            ) VALUES ($1, $2, $3, 'USD', $4, $5, $6, $7)
+                            ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8)
                             "#,
                         )
                         .bind(request_id)
                         .bind(timestamp)
-                        .bind(input_cost + output_cost)
+                        .bind(estimated_cost)
+                        .bind(reported_cost)
                         .bind(&provider)
                         .bind(&model)
                         .bind(input_cost)
@@ -872,6 +886,7 @@ impl TelemetryWriter {
             }
 
             TelemetryEvent::GenerationContent {
+
                 request_id,
                 attempt_number,
                 timestamp,

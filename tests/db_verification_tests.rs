@@ -401,3 +401,124 @@ async fn writer_health_reflects_a_real_successful_flush() {
     assert_eq!(snapshot_after.consecutive_flush_failures, 0);
     assert!(!snapshot_after.fallback_pending);
 }
+
+// ─── Provider-reported cost (OpenRouter's usage.cost) ────────────────────────
+
+fn usage_with(raw: Option<serde_json::Value>) -> Usage {
+    Usage {
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+        total_tokens: 1500,
+        cached_tokens: None,
+        reasoning_tokens: None,
+        raw_provider_usage: raw,
+    }
+}
+
+fn usage_event(request_id: Uuid, raw: Option<serde_json::Value>) -> TelemetryEvent {
+    TelemetryEvent::UsageRecorded {
+        request_id,
+        attempt_number: 1,
+        timestamp: Utc::now(),
+        usage: usage_with(raw),
+        source: "stream_final".to_string(),
+        kind: "cumulative".to_string(),
+    }
+}
+
+async fn cost_rows(pool: &sqlx::PgPool, request_id: Uuid) -> Vec<(Option<f64>, Option<f64>, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT estimated_cost, actual_cost, provider, model FROM cost_records WHERE request_id = $1 ORDER BY id",
+    )
+    .bind(request_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reported_cost_is_recorded_without_any_configured_pricing() {
+    let url = match std::env::var("AUDIT_DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            eprintln!("skipping reported_cost_is_recorded_without_any_configured_pricing: AUDIT_DATABASE_URL not set");
+            return;
+        }
+    };
+    let writer = TelemetryWriter::new_with_fallback_log(&url, 2, 100, 60_000, true, true, "telemetry_fallback.jsonl", HashMap::new())
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let reported = Uuid::now_v7();
+    let silent = Uuid::now_v7();
+    let byok = Uuid::now_v7();
+    run_events(
+        writer,
+        vec![
+            request_received(reported, "m"),
+            attempt_started(reported, "cost-reporter", "cost-model"),
+            usage_event(reported, Some(serde_json::json!({"cost": 0.0125, "is_byok": false}))),
+            // A provider that reports nothing: no row at all, not a zero row.
+            request_received(silent, "m"),
+            attempt_started(silent, "cost-silent", "cost-model"),
+            usage_event(silent, Some(serde_json::json!({"prompt_tokens": 1000}))),
+            // BYOK: our fee plus the upstream charge.
+            request_received(byok, "m"),
+            attempt_started(byok, "cost-reporter", "cost-model"),
+            usage_event(
+                byok,
+                Some(serde_json::json!({"cost": 0.005, "is_byok": true, "cost_details": {"upstream_inference_cost": 0.02}})),
+            ),
+        ],
+    )
+    .await;
+
+    let rows = cost_rows(&pool, reported).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, None, "no price configured, so no estimate");
+    assert!((rows[0].1.unwrap() - 0.0125).abs() < 1e-12);
+    assert_eq!(rows[0].2.as_deref(), Some("cost-reporter"));
+    assert_eq!(rows[0].3.as_deref(), Some("cost-model"));
+
+    assert!(cost_rows(&pool, silent).await.is_empty(), "no reported cost and no price: no row");
+
+    let rows = cost_rows(&pool, byok).await;
+    assert!((rows[0].1.unwrap() - 0.025).abs() < 1e-12, "{rows:?}");
+}
+
+#[tokio::test]
+async fn estimate_and_reported_cost_share_one_row_when_both_exist() {
+    let url = match std::env::var("AUDIT_DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            eprintln!("skipping estimate_and_reported_cost_share_one_row_when_both_exist: AUDIT_DATABASE_URL not set");
+            return;
+        }
+    };
+    let mut pricing = HashMap::new();
+    pricing.insert(
+        "cost-both-provider/cost-model".to_string(),
+        PricingEntry { input_cost_per_1k: 1.0, output_cost_per_1k: 2.0 },
+    );
+    let writer = TelemetryWriter::new_with_fallback_log(&url, 2, 100, 60_000, true, true, "telemetry_fallback.jsonl", pricing)
+        .await
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let request_id = Uuid::now_v7();
+    run_events(
+        writer,
+        vec![
+            request_received(request_id, "m"),
+            attempt_started(request_id, "cost-both-provider", "cost-model"),
+            usage_event(request_id, Some(serde_json::json!({"cost": 1.75}))),
+        ],
+    )
+    .await;
+
+    let rows = cost_rows(&pool, request_id).await;
+    assert_eq!(rows.len(), 1, "one row per attempt, not one for the estimate and one for the report: {rows:?}");
+    assert!((rows[0].0.unwrap() - 2.0).abs() < 1e-9, "estimate from the price table");
+    assert!((rows[0].1.unwrap() - 1.75).abs() < 1e-9, "provider-reported actual");
+}

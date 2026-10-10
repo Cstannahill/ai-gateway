@@ -24,6 +24,7 @@ The **AI Gateway** exposes an OpenAI-compatible HTTP API alongside native monito
 | [`/v1/analytics/fallbacks`](#13-get-v1analyticsfallbacks) | `GET` | Fallback frequency & root cause | JSON |
 | [`/v1/analytics/costs`](#14-get-v1analyticscosts) | `GET` | Estimated cost summary & pricing coverage | JSON |
 | [`/v1/analytics/persistence`](#15-get-v1analyticspersistence) | `GET` | Telemetry write-pipeline health | JSON |
+| [`/metrics/prometheus`](#18-get-metricsprometheus) | `GET` | Live metrics in Prometheus text format | text |
 | [`/admin/reload`](#17-adminreload--configuration-hot-reload) | `POST`/`GET` | Reload config + env file without a restart; reload status | JSON |
 
 ---
@@ -655,7 +656,12 @@ Fallback frequency and root cause: for each of the most recent successful reques
 
 ## 14. GET `/v1/analytics/costs`
 
-Cost summary: total estimated charge, pricing coverage, and a per-provider/model breakdown, computed from `cost_records` (itself populated only when `config.pricing` has an entry for a given `"provider/model"` deployment — see `docs/CONFIGURATION_GUIDE.md`). A missing price yields an *unpriced* attempt, not a zero-cost one; an explicitly configured zero price is priced. `billed_cost` is always `null` — this is an estimate from configured prices, never an actual provider invoice.
+Cost summary: estimated charge, provider-reported cost, coverage of each, and a per-provider/model breakdown, computed from `cost_records`. Two independent sources fill it:
+
+- **Estimated** (`estimated_token_charge`): token usage × the `config.pricing` entry for that `"provider/model"` deployment. A missing price yields an *unpriced* attempt, not a zero-cost one; an explicitly configured zero price is priced.
+- **Reported** (`reported_cost`): the cost the provider itself put in its usage object - OpenRouter's `usage.cost` (credits = USD), plus `cost_details.upstream_inference_cost` when the request used your own key (`is_byok`). Needs no `pricing` entry. Providers that report nothing (Gemini, Hugging Face, Ollama, local servers) are absent from `reported_attempts`, never counted as free.
+
+`billed_cost` is always `null`: neither an estimate nor a per-response figure is an invoice.
 
 ### Query Parameters
 | Parameter | Type | Description |
@@ -668,6 +674,8 @@ Cost summary: total estimated charge, pricing coverage, and a per-provider/model
 {
   "currency": "USD",
   "estimated_token_charge": 2.00,
+  "reported_cost": 1.75,
+  "reported_attempts": 1,
   "billed_cost": null,
   "priced_attempts": 1,
   "unpriced_attempts": 1,
@@ -679,6 +687,8 @@ Cost summary: total estimated charge, pricing coverage, and a per-provider/model
       "model": "anthropic/claude-3.5-sonnet",
       "priced_attempts": 1,
       "estimated_cost": 2.00,
+      "reported_attempts": 1,
+      "reported_cost": 1.75,
       "input_cost": 1.00,
       "output_cost": 1.00
     }
@@ -799,3 +809,38 @@ Errors use the standard envelope `{"error": {"message", "type", "code"}}`. Codes
 
 `ok: false` (HTTP `422`) means the new configuration was rejected and the running one is unchanged; `error` says why. `applied: false` with `ok: true` means the files had no effective changes. `trigger` is `endpoint` or `watch`. Variable and section names only - never values.
 
+---
+
+## 18. GET `/metrics/prometheus`
+
+The live numbers behind `/metrics` (which stays JSON, unchanged) in Prometheus text exposition format 0.0.4, `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Guarded like `/admin/*`: a loopback `Host` and no browser `Origin` (a Prometheus scraper sends none) - point it at `localhost` or `127.0.0.1`; `403` otherwise.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: ai-gateway
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["127.0.0.1:8999"]
+```
+
+| Family | Type | Labels | Meaning |
+|:---|:---|:---|:---|
+| `gateway_info` | gauge | `version` | Always 1 |
+| `gateway_uptime_seconds` | gauge | | |
+| `gateway_requests_total` | counter | | Requests received, all endpoints |
+| `gateway_provider_requests_total` | counter | `provider` | Provider attempts (retries and fallbacks each count) |
+| `gateway_provider_errors_total` | counter | `provider` | Failed attempts |
+| `gateway_provider_active_requests` | gauge | `provider` | In flight |
+| `gateway_provider_health` | gauge | `provider`, `state` | State set: current state 1, others 0 |
+| `gateway_provider_circuit_open` | gauge | `provider` | 1 while the circuit breaker is open |
+| `gateway_provider_cooling_down` | gauge | `provider` | 1 while skipped because it asked for a wait |
+| `gateway_provider_reported_cost_usd_total` | counter | `provider` | USD providers reported since startup |
+| `gateway_provider_request_duration_seconds` | histogram | `provider` | Successfully served requests; buckets 0.05 s to 300 s |
+| `gateway_cache_hits_total` / `_misses_total` / `gateway_cache_entries` | counter/counter/gauge | | Only when `caching.enabled` |
+| `gateway_telemetry_mode` | gauge | `mode` | State set |
+| `gateway_telemetry_dropped_events_total` | counter | | Events dropped on a full queue |
+| `gateway_telemetry_last_flush_ok`, `gateway_telemetry_consecutive_flush_failures` | gauge | | Postgres write health |
+| `gateway_config_reloads_applied_total`, `gateway_config_last_reload_ok` | counter/gauge | | Config hot-reload |
+
+All counters reset when the gateway restarts (Prometheus handles that). Time-to-first-token and tokens-per-second are not exported here; they live in Postgres and are served by `/v1/analytics/providers/comparison`.

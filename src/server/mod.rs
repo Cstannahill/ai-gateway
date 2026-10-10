@@ -3,6 +3,7 @@
 // Axum application builder, route registration, and shared application state.
 
 pub mod middleware;
+pub mod prometheus;
 pub mod routes;
 
 use std::sync::Arc;
@@ -92,6 +93,16 @@ impl AppState {
         self.config.get()
     }
 
+    /// Add the cost a provider reported in its usage object (OpenRouter's
+    /// `usage.cost`) to that provider's running total, for the Prometheus
+    /// endpoint. The durable record is the `cost_records` row the telemetry
+    /// writer makes from the same usage object.
+    pub fn record_provider_cost(&self, provider: &str, raw_usage: &Option<serde_json::Value>) {
+        if let Some(usd) = raw_usage.as_ref().and_then(crate::telemetry::cost::reported_cost_usd) {
+            self.provider_registry.record_reported_cost(provider, usd);
+        }
+    }
+
     /// Send a telemetry event non-blockingly, logging a warning if the channel is full.
     pub fn emit_telemetry(&self, event: TelemetryEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.telemetry_tx.try_send(event) {
@@ -121,6 +132,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(routes::management_routes())
         .merge(routes::analytics_routes())
         .merge(routes::admin_routes())
+        .merge(routes::prometheus_routes())
         .merge(routes::llama_server_routes(state.clone()))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

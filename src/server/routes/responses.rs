@@ -352,6 +352,9 @@ pub async fn handle(
                                 if matches!(&event, ProviderEvent::Completed { .. }) {
                                     guard.completed.store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
+                                if let ProviderEvent::UsageUpdate { raw_usage, .. } = &event {
+                                    guard.state.record_provider_cost(&guard.provider, raw_usage);
+                                }
                                 match &event {
                                     ProviderEvent::ContentDelta { delta, .. } => Some(
                                         Event::default()
@@ -456,8 +459,10 @@ pub async fn handle(
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens,
+                                raw_usage,
                                 ..
                             } => {
+                                state.record_provider_cost(&candidate.provider, &raw_usage);
                                 // The Responses API's own field names are
                                 // `input_tokens`/`output_tokens`, not Chat
                                 // Completions' `prompt_tokens`/

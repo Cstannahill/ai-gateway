@@ -91,3 +91,11 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/admin/reload", get(admin::reload_status).post(admin::reload))
         .route_layer(axum::middleware::from_fn(admin::admin_guard))
 }
+
+/// Prometheus scrape endpoint, behind the same loopback/no-browser guard as
+/// the admin routes.
+pub fn prometheus_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/metrics/prometheus", get(metrics::handle_prometheus))
+        .route_layer(axum::middleware::from_fn(admin::admin_guard))
+}

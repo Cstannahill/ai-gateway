@@ -919,10 +919,10 @@ pub struct CostsQuery {
 /// priced (counted in `priced_attempts` with its zero contributing to the
 /// sum) — `priced_attempts`/`unpriced_attempts`/`eligible_attempts` let a
 /// caller tell these apart instead of a bare total implying full coverage.
-/// `billed_cost` is always `null`: this gateway has no concept of an
-/// actual provider invoice, only an estimate from configured prices —
-/// `cost_records.actual_cost` exists in the schema but nothing populates
-/// it, and this endpoint does not pretend otherwise.
+/// `reported_cost` sums `cost_records.actual_cost`, the cost a provider put in
+/// its own usage object (OpenRouter's `usage.cost`). `billed_cost` is always
+/// `null`: neither an estimate nor a provider's per-response figure is an
+/// invoice, and this endpoint does not pretend otherwise.
 ///
 /// This is a whole-history summary, not a bucketed time series — see
 /// docs/frontend/API_GAPS.md item 1 for the (not yet implemented)
@@ -950,9 +950,9 @@ pub async fn cost_summary(State(state): State<Arc<AppState>>, Query(q): Query<Co
         Err(e) => return query_error(e),
     };
 
-    let (estimated_token_charge, priced_attempts): (Option<f64>, i64) = match sqlx::query_as(
+    let (estimated_token_charge, priced_attempts, reported_cost, reported_attempts): (Option<f64>, i64, Option<f64>, i64) = match sqlx::query_as(
         r#"
-        SELECT SUM(c.estimated_cost), COUNT(*)
+        SELECT SUM(c.estimated_cost), COUNT(c.estimated_cost), SUM(c.actual_cost), COUNT(c.actual_cost)
         FROM cost_records c
         WHERE ($1::text IS NULL OR c.provider = $1)
           AND ($2::text IS NULL OR c.model = $2)
@@ -969,14 +969,15 @@ pub async fn cost_summary(State(state): State<Arc<AppState>>, Query(q): Query<Co
 
     let breakdowns: Vec<CostBreakdownRow> = match sqlx::query_as(
         r#"
-        SELECT c.provider, c.model, COUNT(*) AS priced_attempts,
+        SELECT c.provider, c.model, COUNT(c.estimated_cost) AS priced_attempts,
                SUM(c.estimated_cost) AS estimated_cost,
+               COUNT(c.actual_cost) AS reported_attempts, SUM(c.actual_cost) AS reported_cost,
                SUM(c.input_cost) AS input_cost, SUM(c.output_cost) AS output_cost
         FROM cost_records c
         WHERE ($1::text IS NULL OR c.provider = $1)
           AND ($2::text IS NULL OR c.model = $2)
         GROUP BY c.provider, c.model
-        ORDER BY estimated_cost DESC NULLS LAST
+        ORDER BY COALESCE(SUM(c.actual_cost), SUM(c.estimated_cost)) DESC NULLS LAST
         "#,
     )
     .bind(&q.provider)
@@ -995,6 +996,12 @@ pub async fn cost_summary(State(state): State<Arc<AppState>>, Query(q): Query<Co
         // rather than a config value that doesn't exist.
         "currency": "USD",
         "estimated_token_charge": estimated_token_charge,
+        // What providers said these requests cost, from their own usage
+        // objects (OpenRouter's `usage.cost`). Covers only the attempts in
+        // `reported_attempts`; providers that report nothing are absent from
+        // it, not counted as free.
+        "reported_cost": reported_cost,
+        "reported_attempts": reported_attempts,
         "billed_cost": serde_json::Value::Null,
         "priced_attempts": priced_attempts,
         "unpriced_attempts": (eligible_attempts - priced_attempts).max(0),
@@ -1011,6 +1018,8 @@ struct CostBreakdownRow {
     model: Option<String>,
     priced_attempts: i64,
     estimated_cost: Option<f64>,
+    reported_attempts: i64,
+    reported_cost: Option<f64>,
     input_cost: Option<f64>,
     output_cost: Option<f64>,
 }
