@@ -140,15 +140,25 @@ pub fn load_env_file(explicit: Option<&str>) -> Result<Option<EnvFileLoad>, Stri
     }
     // Found before loading: `from_path` leaves already-set variables alone, so
     // afterwards there is no way to tell that a value was overridden.
-    let shadowed = dotenvy::from_path_iter(&path)
+    let entries: Vec<(String, String)> = dotenvy::from_path_iter(&path)
         .map_err(|e| format!("cannot load env file '{}': {e}", path.display()))?
         .filter_map(Result::ok)
+        .collect();
+    let shadowed = entries
+        .iter()
         .filter(|(name, value)| std::env::var(name).is_ok_and(|current| current != *value))
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Which names the file (rather than the real environment) ends up
+    // supplying - a later reload may change or remove exactly these.
+    let applied = entries
+        .iter()
+        .filter(|(name, _)| std::env::var(name).is_err())
+        .map(|(name, _)| name.clone())
         .collect();
     dotenvy::from_path(&path)
         .map_err(|e| format!("cannot load env file '{}': {e}", path.display()))?;
-    Ok(Some(EnvFileLoad { path, shadowed }))
+    Ok(Some(EnvFileLoad { path, shadowed, applied }))
 }
 
 /// The result of loading an env file.
@@ -161,6 +171,9 @@ pub struct EnvFileLoad {
     /// should warn, because a stale key hiding behind a correct `.env` is
     /// otherwise invisible. Names only.
     pub shadowed: Vec<String>,
+    /// Variables the file itself supplied (they were unset in the real
+    /// environment). A config reload may change or remove exactly these.
+    pub applied: Vec<String>,
 }
 
 /// `ai-gateway <version>` line printed by `--version`.

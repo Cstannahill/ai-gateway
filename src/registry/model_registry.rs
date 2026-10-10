@@ -13,13 +13,23 @@ use crate::types::{ModelCandidate, ModelCapabilities, ModelDefinition, ModelInfo
 // Aliases enable policy. Explicit IDs enable reproducibility.
 
 pub struct ModelRegistry {
-    /// Alias → model definition.
-    models: HashMap<String, ModelDefinition>,
+    /// Alias → model definition. Swapped wholesale by a config reload
+    /// ([`ModelRegistry::replace`]); a lookup in progress keeps the map it started on.
+    models: std::sync::RwLock<std::sync::Arc<HashMap<String, ModelDefinition>>>,
 }
 
 impl ModelRegistry {
     pub fn new(models: HashMap<String, ModelDefinition>) -> Self {
-        Self { models }
+        Self { models: std::sync::RwLock::new(std::sync::Arc::new(models)) }
+    }
+
+    /// Replace every alias (config hot-reload).
+    pub fn replace(&self, models: HashMap<String, ModelDefinition>) {
+        *self.models.write().unwrap() = std::sync::Arc::new(models);
+    }
+
+    fn snapshot(&self) -> std::sync::Arc<HashMap<String, ModelDefinition>> {
+        self.models.read().unwrap().clone()
     }
 
     /// Resolve a model identifier to candidate deployments.
@@ -30,8 +40,9 @@ impl ModelRegistry {
     ///   `provider/model` reference.
     /// - Otherwise, return an error.
     pub fn resolve(&self, model_id: &str) -> anyhow::Result<ResolvedModel> {
+        let models = self.snapshot();
         // Check for alias match first.
-        if let Some(definition) = self.models.get(model_id) {
+        if let Some(definition) = models.get(model_id) {
             let mut candidates = definition.candidates.clone();
             candidates.sort_by_key(|c| c.priority);
 
@@ -70,7 +81,7 @@ impl ModelRegistry {
 
     /// List all registered models (for /v1/models endpoint).
     pub fn list_models(&self) -> Vec<ModelInfo> {
-        self.models
+        self.snapshot()
             .iter()
             .map(|(name, def)| {
                 let providers: Vec<String> =
@@ -83,13 +94,13 @@ impl ModelRegistry {
     /// Check if a model alias exists.
     #[allow(dead_code)]
     pub fn has_alias(&self, alias: &str) -> bool {
-        self.models.contains_key(alias)
+        self.snapshot().contains_key(alias)
     }
 
     /// Get a model definition by alias.
     #[allow(dead_code)]
-    pub fn get(&self, alias: &str) -> Option<&ModelDefinition> {
-        self.models.get(alias)
+    pub fn get(&self, alias: &str) -> Option<ModelDefinition> {
+        self.snapshot().get(alias).cloned()
     }
 }
 

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod llama_server;
 pub mod providers;
+pub mod reload;
 pub mod registry;
 pub mod routing;
 pub mod server;

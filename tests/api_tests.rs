@@ -19,7 +19,7 @@ fn setup_test_app() -> axum::Router {
     let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(100);
 
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry,
         provider_registry,
         router,
@@ -29,6 +29,7 @@ fn setup_test_app() -> axum::Router {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 
@@ -166,7 +167,7 @@ async fn test_gateway_request_counter_counts_actual_requests() {
     let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(100);
 
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry,
         provider_registry,
         router,
@@ -176,6 +177,7 @@ async fn test_gateway_request_counter_counts_actual_requests() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 
@@ -245,7 +247,7 @@ async fn test_persistence_health_counts_dropped_events_and_channel_backlog() {
     let telemetry_health = Arc::new(TelemetryHealth::new(TelemetryMode::Database));
 
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry,
         provider_registry,
         router,
@@ -256,6 +258,7 @@ async fn test_persistence_health_counts_dropped_events_and_channel_backlog() {
         analytics_pool: None,
         response_cache: None,
         llama_server: None,
+        reloader: None,
     });
 
     // Fill the one slot, then overflow it twice.

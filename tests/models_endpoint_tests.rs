@@ -61,7 +61,7 @@ async fn discovered_models_have_a_capabilities_object_not_null() {
 
     let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(10);
     let state = Arc::new(AppState {
-        config: GatewayConfig::load(None).unwrap(),
+        config: GatewayConfig::load(None).unwrap().into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry,
         router: RoutingEngine::new("priority".to_string()),
@@ -73,6 +73,7 @@ async fn discovered_models_have_a_capabilities_object_not_null() {
         )),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 

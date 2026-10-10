@@ -129,7 +129,7 @@ async fn seeded_state_and_request_id() -> Option<(Arc<AppState>, Uuid)> {
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -139,6 +139,7 @@ async fn seeded_state_and_request_id() -> Option<(Arc<AppState>, Uuid)> {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -160,7 +161,7 @@ async fn get(state: Arc<AppState>, path: &str) -> (StatusCode, serde_json::Value
 async fn analytics_returns_503_without_a_database() {
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -170,6 +171,7 @@ async fn analytics_returns_503_without_a_database() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 
@@ -292,7 +294,7 @@ async fn analytics_fallback_analysis_reflects_a_failed_then_succeeded_request() 
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -302,6 +304,7 @@ async fn analytics_fallback_analysis_reflects_a_failed_then_succeeded_request() 
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -463,7 +466,7 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -473,6 +476,7 @@ async fn analytics_provider_comparison_does_not_multiply_attempts_with_multiple_
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -618,7 +622,7 @@ async fn analytics_cost_summary_distinguishes_priced_from_unpriced_attempts() {
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -628,6 +632,7 @@ async fn analytics_cost_summary_distinguishes_priced_from_unpriced_attempts() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -789,7 +794,7 @@ async fn analytics_summary_covers_boundaries_retries_pending_and_usage_dedup() {
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -799,6 +804,7 @@ async fn analytics_summary_covers_boundaries_retries_pending_and_usage_dedup() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -863,7 +869,7 @@ async fn analytics_summary_rejects_invalid_bucket_and_oversized_range() {
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -873,6 +879,7 @@ async fn analytics_summary_rejects_invalid_bucket_and_oversized_range() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -955,7 +962,7 @@ async fn analytics_requests_keyset_pagination_is_stable_under_concurrent_inserts
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -965,6 +972,7 @@ async fn analytics_requests_keyset_pagination_is_stable_under_concurrent_inserts
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool.clone()),
     });
 
@@ -1094,7 +1102,7 @@ async fn analytics_requests_supports_attempted_provider_application_task_and_tag
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -1104,6 +1112,7 @@ async fn analytics_requests_supports_attempted_provider_application_task_and_tag
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -1268,7 +1277,7 @@ async fn analytics_request_detail_includes_attempt_spans_routing_errors_and_cost
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -1278,6 +1287,7 @@ async fn analytics_request_detail_includes_attempt_spans_routing_errors_and_cost
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -1361,7 +1371,7 @@ async fn analytics_timeline_cursor_pagination_returns_each_event_exactly_once() 
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -1371,6 +1381,7 @@ async fn analytics_timeline_cursor_pagination_returns_each_event_exactly_once() 
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -1478,7 +1489,7 @@ async fn analytics_request_detail_exposes_stable_id_and_choice_index_per_generat
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -1488,6 +1499,7 @@ async fn analytics_request_detail_exposes_stable_id_and_choice_index_per_generat
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 
@@ -1588,7 +1600,7 @@ async fn analytics_usage_canonical_flags_single_duplicate_and_conflicting_observ
 
     let config = GatewayConfig::load(None).unwrap();
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -1598,6 +1610,7 @@ async fn analytics_usage_canonical_flags_single_duplicate_and_conflicting_observ
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: Some(pool),
     });
 

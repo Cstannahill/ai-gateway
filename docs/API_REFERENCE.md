@@ -24,6 +24,7 @@ The **AI Gateway** exposes an OpenAI-compatible HTTP API alongside native monito
 | [`/v1/analytics/fallbacks`](#13-get-v1analyticsfallbacks) | `GET` | Fallback frequency & root cause | JSON |
 | [`/v1/analytics/costs`](#14-get-v1analyticscosts) | `GET` | Estimated cost summary & pricing coverage | JSON |
 | [`/v1/analytics/persistence`](#15-get-v1analyticspersistence) | `GET` | Telemetry write-pipeline health | JSON |
+| [`/admin/reload`](#17-adminreload--configuration-hot-reload) | `POST`/`GET` | Reload config + env file without a restart; reload status | JSON |
 
 ---
 
@@ -774,3 +775,27 @@ Optional (`llama_server.enabled`, default off). Save models under aliases and st
 | `POST` | `/llama-server/args/parse` | tokenize + validate an argument string (`argv`, `issues`) |
 
 Errors use the standard envelope `{"error": {"message", "type", "code"}}`. Codes: `feature_disabled`, `not_found`, `invalid_request`, `invalid_alias`, `invalid_path`, `path_not_found`, `path_not_file`, `not_gguf`, `reserved_flag`, `invalid_args` (400); `alias_taken`, `already_running`, `model_in_use`, `port_in_use`, `nothing_to_restart` (409); `spawn_failed`, `internal_error` (500). A malformed JSON body yields the framework's plain-text `400/415/422`.
+
+---
+
+## 17. `/admin/reload` - configuration hot-reload
+
+`POST /admin/reload` re-reads `gateway.yaml` and the env file and applies them to the running gateway (see `docs/CONFIGURATION_GUIDE.md` section 5 for what is and is not reloadable). `GET /admin/reload` returns the watched files, the number of reloads applied, and the last report. Refused with `403` (`origin_forbidden` / `host_forbidden`) for browser origins and non-loopback hosts; `404 reload_unavailable` if the instance has no reloader.
+
+```json
+{
+  "at": "2026-10-09T22:12:10Z",
+  "trigger": "endpoint",
+  "ok": true,
+  "applied": true,
+  "providers": { "added": ["b"], "updated": [], "removed": [] },
+  "models":    { "added": ["new"], "updated": [], "removed": [] },
+  "env_changed": ["OPENROUTER_API_KEY"],
+  "env_shadowed": [],
+  "restart_required": ["caching"],
+  "error": null
+}
+```
+
+`ok: false` (HTTP `422`) means the new configuration was rejected and the running one is unchanged; `error` says why. `applied: false` with `ok: true` means the files had no effective changes. `trigger` is `endpoint` or `watch`. Variable and section names only - never values.
+

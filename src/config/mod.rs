@@ -4,6 +4,8 @@ use std::path::Path;
 
 use crate::types::{ModelDefinition, ProviderConfig};
 
+pub mod env;
+
 // ─── Gateway Configuration ──────────────────────────────────────────────────
 //
 // YAML-driven configuration for the entire gateway: providers, models,
@@ -55,7 +57,7 @@ pub struct GatewayConfig {
 
 /// Configuration for the llama-server manager (`src/llama_server/`). See
 /// `docs/CONFIGURATION_GUIDE.md` and `docs/frontend/LLAMA_SERVER_UI.md`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LlamaServerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -189,7 +191,7 @@ pub struct PricingEntry {
 /// Response cache configuration. See `src/cache/mod.rs` and
 /// `docs/ROUTING_AND_POLICIES.md`'s caching section for exactly what this
 /// caches and why it's scoped to non-streaming requests only.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CachingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -223,7 +225,7 @@ fn default_cache_max_entries() -> usize {
 }
 
 /// Server bind / runtime configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerConfig {
     /// Host to bind to.
     #[serde(default = "default_host")]
@@ -271,7 +273,7 @@ fn default_shutdown_timeout() -> u64 {
 }
 
 /// Default routing configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RoutingConfig {
     /// Default routing policy.
     #[serde(default = "default_policy")]
@@ -356,7 +358,7 @@ fn default_max_retry_after() -> u64 {
 }
 
 /// Telemetry / data pipeline configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TelemetryConfig {
     /// Whether telemetry recording is enabled.
     #[serde(default = "default_true")]
@@ -476,17 +478,25 @@ impl GatewayConfig {
         Ok(config)
     }
 
+    /// The config file `load` would read: the given path, else
+    /// `config/gateway.yaml`, else `gateway.yaml`; `None` means built-in
+    /// defaults. Resolved once at startup so a reload re-reads the same file
+    /// even if the working directory is never consulted again.
+    pub fn resolve_path(path: Option<&str>) -> Option<std::path::PathBuf> {
+        if let Some(p) = path {
+            return Some(std::path::PathBuf::from(p));
+        }
+        ["config/gateway.yaml", "gateway.yaml"]
+            .iter()
+            .find(|c| Path::new(c).exists())
+            .map(std::path::PathBuf::from)
+    }
+
     /// Load with fallback: try the given path, then `config/gateway.yaml`,
     /// then `gateway.yaml`, then fall back to defaults.
     pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
-        if let Some(p) = path {
-            return Self::from_file(p);
-        }
-
-        for candidate in &["config/gateway.yaml", "gateway.yaml"] {
-            if Path::new(candidate).exists() {
-                return Self::from_file(candidate);
-            }
+        if let Some(file) = Self::resolve_path(path) {
+            return Self::from_file(file);
         }
 
         tracing::warn!("No configuration file found, using defaults");

@@ -126,20 +126,10 @@ async fn run(
             pconfig.name = name.clone();
         }
 
-        let mut adapter: Arc<dyn Provider> = providers::build_adapter(&pconfig)?;
-
-        // The provider that talks to the managed llama-server also lists the
-        // saved models and loads the requested one on demand.
-        if let Some(manager) = &llama_server
-            && manager.config().provider.as_deref() == Some(name.as_str())
-        {
-            adapter = Arc::new(providers::llama_managed::ManagedLlamaProvider::new(adapter, manager.clone()));
-            tracing::info!(
-                provider = %name,
-                auto_swap = manager.config().auto_swap,
-                "Provider is backed by the managed llama-server"
-            );
-        }
+        // Also wraps the provider linked to the managed llama-server (same
+        // helper config reload uses).
+        let adapter: Arc<dyn Provider> =
+            providers::build_registered_adapter(&pconfig, llama_server.as_ref())?;
 
         tracing::info!(
             provider = %name,
@@ -204,8 +194,20 @@ async fn run(
         ))
     });
 
+    // Config hot-reload: remembers which files to re-read and what each running
+    // provider adapter was built from.
+    let env_file = match &loaded_env_file {
+        Some(loaded) => ai_gateway::config::env::EnvFile::new(loaded.path.clone(), loaded.applied.clone()),
+        None => ai_gateway::config::env::EnvFile::new(std::path::PathBuf::from(".env"), []),
+    };
+    let reloader = Arc::new(ai_gateway::reload::Reloader::new(
+        GatewayConfig::resolve_path(config_path.as_deref()),
+        Some(env_file),
+        &config,
+    ));
+
     let state = Arc::new(AppState {
-        config: config.clone(),
+        config: config.clone().into(),
         model_registry,
         provider_registry,
         router,
@@ -216,6 +218,7 @@ async fn run(
         telemetry_health: telemetry.health(),
         response_cache,
         llama_server: llama_server.clone(),
+        reloader: Some(reloader),
     });
 
     // ─── Snapshot configured models once at startup ───────────────────────
@@ -280,6 +283,10 @@ async fn run(
         }
     });
 
+    // Reload when gateway.yaml or the env file changes on disk.
+    let (watch_shutdown_tx, watch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let watch_task = ai_gateway::reload::spawn_watcher(state.clone(), watch_shutdown_rx);
+
     // ─── Build Axum application ──────────────────────────────────────────
     // Keep our own Arc<AppState> clone alive (rather than moving the last
     // one into the router) so the shutdown sequence below can explicitly
@@ -341,6 +348,10 @@ async fn run(
     // our remaining clone, then close the pipeline's own sender and await
     // the writer task so any buffered batch is flushed rather than
     // abandoned when the process exits (docs/REMEDIATION_PLAN.md Phase 0.5).
+    let _ = watch_shutdown_tx.send(());
+    if let Err(e) = watch_task.await {
+        tracing::warn!(error = %e, "Config watcher did not shut down cleanly");
+    }
     let _ = health_shutdown_tx.send(());
     if let Err(e) = health_task.await {
         tracing::warn!(error = %e, "Health check worker did not shut down cleanly");

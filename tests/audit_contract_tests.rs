@@ -170,7 +170,7 @@ fn setup(
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     (
         Arc::new(AppState {
-            config,
+            config: config.into(),
             model_registry: ModelRegistry::new(models),
             provider_registry: providers,
             router: RoutingEngine::new("ordered".into()),
@@ -180,6 +180,7 @@ fn setup(
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
             analytics_pool: None,
         }),
         rx,
@@ -224,7 +225,7 @@ fn setup_embeddings(
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     (
         Arc::new(AppState {
-            config,
+            config: config.into(),
             model_registry: ModelRegistry::new(models),
             provider_registry: providers,
             router: RoutingEngine::new("ordered".into()),
@@ -234,6 +235,7 @@ fn setup_embeddings(
             telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
             analytics_pool: None,
         }),
         rx,
@@ -658,7 +660,7 @@ async fn response_cache_serves_a_repeated_non_streaming_request_without_a_second
     .unwrap();
     let (tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(models),
         provider_registry: providers,
         router: RoutingEngine::new("ordered".into()),
@@ -673,6 +675,7 @@ async fn response_cache_serves_a_repeated_non_streaming_request_without_a_second
             100,
         ))),
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 

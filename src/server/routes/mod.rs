@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod analytics;
 pub mod assets;
 pub mod chat_completions;
@@ -81,4 +82,12 @@ pub fn llama_server_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/llama-server/args/parse", post(llama_server::parse_args))
         .route_layer(axum::middleware::from_fn_with_state(state, llama_server::browser_guard))
+}
+
+/// Operator controls (`/admin/*`), behind the same browser-origin guard as
+/// `/llama-server/*`.
+pub fn admin_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/admin/reload", get(admin::reload_status).post(admin::reload))
+        .route_layer(axum::middleware::from_fn(admin::admin_guard))
 }

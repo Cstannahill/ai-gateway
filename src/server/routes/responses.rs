@@ -179,9 +179,9 @@ pub async fn handle(
 
     // ─── Build Retry / Fallback Configuration ────────────────────────────
     let retry_config = fallback::RetryConfig {
-        max_attempts_per_provider: state.config.routing.max_retries_per_provider,
+        max_attempts_per_provider: state.config().routing.max_retries_per_provider,
         fallback_on: state
-            .config
+            .config()
             .routing
             .fallback_on
             .iter()
@@ -197,7 +197,7 @@ pub async fn handle(
         ..Default::default()
     };
 
-    let max_retries = state.config.routing.max_retries_per_provider.max(1);
+    let max_retries = state.config().routing.max_retries_per_provider.max(1);
     let mut attempt_number = 0u32;
     let mut last_error: Option<String> = None;
 
@@ -224,7 +224,7 @@ pub async fn handle(
                 model: candidate.model.clone(),
             });
 
-            let attempt_timeout = std::time::Duration::from_secs(state.config.routing.attempt_timeout_secs.max(1));
+            let attempt_timeout = std::time::Duration::from_secs(state.config().routing.attempt_timeout_secs.max(1));
             let exec_result = tokio::time::timeout(attempt_timeout, provider.execute(&request, &candidate.model)).await;
 
             match exec_result {
@@ -247,7 +247,7 @@ pub async fn handle(
                         attempt_number,
                         state.telemetry_tx.clone(),
                         state.telemetry_health.clone(),
-                        state.config.telemetry.store_stream_events,
+                        state.config().telemetry.store_stream_events,
                         !stream,
                     );
 
@@ -257,9 +257,9 @@ pub async fn handle(
                         // anything is a failed attempt, not a broken answer.
                         let mut instrumented = Box::pin(instrumented);
                         let mut replay = Vec::new();
-                        if state.config.routing.stream_failover {
+                        if state.config().routing.stream_failover {
                             let first_token_timeout = state
-                                .config
+                                .config()
                                 .routing
                                 .first_token_timeout_secs
                                 .map(std::time::Duration::from_secs);
@@ -644,7 +644,7 @@ pub async fn handle(
                 }
                 Err(_elapsed) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
-                    let err_msg = format!("Attempt timed out after {}s", state.config.routing.attempt_timeout_secs);
+                    let err_msg = format!("Attempt timed out after {}s", state.config().routing.attempt_timeout_secs);
                     last_error = Some(err_msg.clone());
 
                     state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {

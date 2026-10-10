@@ -77,31 +77,41 @@ pub struct RejectionRecord {
 
 /// The routing engine.
 pub struct Router {
-    default_policy: String,
+    default_policy: std::sync::RwLock<String>,
     round_robin_counters: dashmap::DashMap<String, std::sync::atomic::AtomicUsize>,
     /// Per-deployment pricing (`"provider/model"` → rate), used by the
     /// `cheapest`/`balanced` policies. Empty by default — set via
     /// `with_pricing` rather than a constructor parameter so the many
     /// existing `Router::new` call sites across tests (which never
     /// exercise cost-based routing) are unaffected.
-    pricing: std::collections::HashMap<String, crate::config::PricingEntry>,
+    pricing: std::sync::RwLock<std::collections::HashMap<String, crate::config::PricingEntry>>,
 }
 
 impl Router {
     pub fn new(default_policy: String) -> Self {
         Self {
-            default_policy,
+            default_policy: std::sync::RwLock::new(default_policy),
             round_robin_counters: dashmap::DashMap::new(),
-            pricing: std::collections::HashMap::new(),
+            pricing: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     /// Attach pricing data for the `cheapest`/`balanced` policies. A
     /// deployment with no entry here is simply excluded from cost-based
     /// ranking rather than assumed free — see `estimated_cost_usd`.
-    pub fn with_pricing(mut self, pricing: std::collections::HashMap<String, crate::config::PricingEntry>) -> Self {
-        self.pricing = pricing;
+    pub fn with_pricing(self, pricing: std::collections::HashMap<String, crate::config::PricingEntry>) -> Self {
+        self.set_pricing(pricing);
         self
+    }
+
+    /// Replace the pricing table (config hot-reload).
+    pub fn set_pricing(&self, pricing: std::collections::HashMap<String, crate::config::PricingEntry>) {
+        *self.pricing.write().unwrap() = pricing;
+    }
+
+    /// Replace the default routing policy (config hot-reload).
+    pub fn set_default_policy(&self, policy: String) {
+        *self.default_policy.write().unwrap() = policy;
     }
 
     /// Route a request to an ordered list of provider/model candidates.
@@ -471,8 +481,8 @@ impl Router {
                 .routing
                 .as_ref()
                 .and_then(|r| r.policy.as_ref())
-                .unwrap_or(&self.default_policy)
-                .clone();
+                .cloned()
+                .unwrap_or_else(|| self.default_policy.read().unwrap().clone());
             let rejected_count = rejection_reasons.len() as u32;
 
             return Ok(RoutingPlan {
@@ -497,8 +507,8 @@ impl Router {
             .routing
             .as_ref()
             .and_then(|r| r.policy.as_ref())
-            .unwrap_or(&self.default_policy)
-            .clone();
+            .cloned()
+            .unwrap_or_else(|| self.default_policy.read().unwrap().clone());
 
         let mut candidates = compatible;
 
@@ -804,7 +814,8 @@ impl Router {
     /// follows for `unpriced_attempts`).
     fn estimated_cost_usd(&self, candidate: &ModelCandidate, request: &GatewayRequest) -> Option<f64> {
         let key = format!("{}/{}", candidate.provider, candidate.model);
-        let entry = self.pricing.get(&key)?;
+        let pricing = self.pricing.read().unwrap();
+        let entry = pricing.get(&key)?;
         let prompt_tokens = Self::estimate_prompt_tokens(request);
         let completion_tokens = request
             .max_completion_tokens

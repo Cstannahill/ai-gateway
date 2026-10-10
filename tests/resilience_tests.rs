@@ -121,7 +121,7 @@ fn gateway_chain(providers: &[(&str, &str, &str)], tune: impl FnOnce(&mut Gatewa
     let (telemetry_tx, rx) = tokio::sync::mpsc::channel(1000);
     std::mem::forget(rx);
     build_router(Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::from([("chain".to_string(), definition)])),
         provider_registry,
         router: RoutingEngine::new("priority".to_string()),
@@ -133,6 +133,7 @@ fn gateway_chain(providers: &[(&str, &str, &str)], tune: impl FnOnce(&mut Gatewa
         )),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     }))
 }

@@ -18,6 +18,10 @@ When the gateway binary starts, it resolves configuration in the following order
 
 ---
 
+**Reloading.** The file is re-read while the gateway runs - see section 5.
+
+---
+
 ## 2. Complete Configuration Reference
 
 Below is a complete, annotated example showing all available fields across all sections.
@@ -418,3 +422,24 @@ file. Copy `.env.example` to `.env` to start. See `COMMANDS.md` section 2.
 | `HF_API_KEY` | Hugging Face User Access Token | `hf_...` |
 | `OLLAMA_API_KEY` | Ollama Cloud authentication key | `ollama_...` |
 | `RUST_LOG` | Logging verbosity filter | `ai_gateway=debug,tower_http=info` |
+
+---
+
+## 5. Reloading configuration without a restart
+
+The gateway re-reads `gateway.yaml` and the env file (`.env`, or `--env-file`) in two ways:
+
+- **Automatically** when either file changes on disk. Files are checked every 2 seconds and a change is applied only once it has stopped changing for a full check, so an editor's half-finished save is not loaded. A version that fails to load is reported once (in the log and at `GET /admin/reload`) and is not retried until the file changes again.
+- **On demand** with `curl -X POST http://127.0.0.1:8999/admin/reload`. The response (`200`, or `422` if the new configuration was rejected) lists what changed: providers and model aliases added/updated/removed, environment variables whose value changed (names only, never values), and sections that need a restart. `GET /admin/reload` shows the last result.
+
+**What is reloaded:** `providers` (added, removed, changed), `models`, `routing`.
+
+**What needs a restart** (reported in `restart_required`, and the running value stays in effect): `server` (the listening socket), `telemetry` and `pricing` (the writer pipeline keeps its own copy), `caching`, and `llama_server` - it decides which binary the gateway will execute, so it is deliberately never changed behind your back.
+
+**Safety.** The whole new file is parsed and validated, and every new provider adapter built, before anything is swapped; if any step fails, nothing changes. Requests already running finish on the configuration they started with, including streams whose provider was just removed.
+
+**What carries over.** A provider whose settings and API keys did not change keeps its running adapter, so its health, request counters, circuit-breaker state, rate-limit cooldown and API-key rotation state survive a reload. A provider whose settings changed is rebuilt (counters kept, health re-checked within 30 s).
+
+**Environment file.** On reload the env file is re-read, so adding or rotating an API key in `.env` takes effect when you save - no restart. Precedence is the same as at startup: a variable set in the real environment (shell profile, system settings) always wins over the file, and the log warns (names only) when it hides a different value from the file. Providers whose key variable changed are rebuilt with the new keys. The process environment itself is not modified after startup.
+
+**Access.** `/admin/*` is guarded like `/llama-server/*`: requests that carry a browser `Origin`, a cross-site `Sec-Fetch-Site`, or a non-loopback `Host` are refused with `403`. `curl` and the dashboard's server-side proxy send none of those. A dashboard that wants a "Reload" button must add `POST /admin/reload` to its proxy allow-list (the existing `/api/gateway/*` proxy is GET-only).

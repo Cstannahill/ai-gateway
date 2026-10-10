@@ -20,9 +20,32 @@ use crate::registry::{ModelRegistry, ProviderRegistry};
 use crate::routing::Router as RoutingEngine;
 use crate::telemetry::{TelemetryEvent, TelemetryHealth};
 
+/// The gateway configuration as a swappable snapshot. A config reload replaces
+/// the `Arc`; a request clones it once (see [`AppState::config`]) and keeps
+/// that version for its whole life, so no request ever sees a half-applied
+/// change.
+pub struct ConfigCell(std::sync::RwLock<Arc<GatewayConfig>>);
+
+impl ConfigCell {
+    pub fn get(&self) -> Arc<GatewayConfig> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub fn set(&self, config: GatewayConfig) {
+        *self.0.write().unwrap() = Arc::new(config);
+    }
+}
+
+impl From<GatewayConfig> for ConfigCell {
+    fn from(config: GatewayConfig) -> Self {
+        Self(std::sync::RwLock::new(Arc::new(config)))
+    }
+}
+
 /// Shared application state available to all route handlers.
 pub struct AppState {
-    pub config: GatewayConfig,
+    /// Current configuration; read it through [`AppState::config`].
+    pub config: ConfigCell,
     pub model_registry: ModelRegistry,
     pub provider_registry: ProviderRegistry,
     pub router: RoutingEngine,
@@ -56,9 +79,19 @@ pub struct AppState {
     /// llama-server process manager behind `/llama-server/*`. `None` unless
     /// `llama_server.enabled` — the only feature that executes a local binary.
     pub llama_server: Option<Arc<crate::llama_server::LlamaServerManager>>,
+    /// Config/env hot-reload (`POST /admin/reload`). `None` when the gateway
+    /// was started without a way to re-read its configuration (tests).
+    pub reloader: Option<Arc<crate::reload::Reloader>>,
 }
 
 impl AppState {
+    /// The configuration to use for one request. Take it once at the start of
+    /// the handler and reuse it; calling it repeatedly may observe a reload
+    /// part-way through the request.
+    pub fn config(&self) -> Arc<GatewayConfig> {
+        self.config.get()
+    }
+
     /// Send a telemetry event non-blockingly, logging a warning if the channel is full.
     pub fn emit_telemetry(&self, event: TelemetryEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.telemetry_tx.try_send(event) {
@@ -81,12 +114,13 @@ impl AppState {
 
 /// Build the Axum application with all routes and middleware layers.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let body_limit = state.config.server.body_limit_bytes;
+    let body_limit = state.config().server.body_limit_bytes;
 
     Router::new()
         .merge(routes::openai_routes())
         .merge(routes::management_routes())
         .merge(routes::analytics_routes())
+        .merge(routes::admin_routes())
         .merge(routes::llama_server_routes(state.clone()))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

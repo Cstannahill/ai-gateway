@@ -154,7 +154,7 @@ impl OpenAICompatibleAdapter {
             config
                 .api_key_env
                 .as_ref()
-                .and_then(|env| std::env::var(env).ok())
+                .and_then(|env| crate::config::env::lookup(env))
         });
         let keys = KeyRing::new(raw_keys.as_deref().map(KeyRing::parse).unwrap_or_default());
         if keys.len() > 1 {

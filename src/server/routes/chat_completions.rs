@@ -267,9 +267,9 @@ async fn dispatch(
 
     // ─── Build Retry / Fallback Configuration ────────────────────────────
     let retry_config = fallback::RetryConfig {
-        max_attempts_per_provider: state.config.routing.max_retries_per_provider,
+        max_attempts_per_provider: state.config().routing.max_retries_per_provider,
         fallback_on: state
-            .config
+            .config()
             .routing
             .fallback_on
             .iter()
@@ -285,7 +285,7 @@ async fn dispatch(
         ..Default::default()
     };
 
-    let max_retries = state.config.routing.max_retries_per_provider.max(1);
+    let max_retries = state.config().routing.max_retries_per_provider.max(1);
     let mut attempt_number = 0u32;
     let mut last_error: Option<String> = None;
 
@@ -318,7 +318,7 @@ async fn dispatch(
                 model: candidate.model.clone(),
             });
 
-            let attempt_timeout = std::time::Duration::from_secs(state.config.routing.attempt_timeout_secs.max(1));
+            let attempt_timeout = std::time::Duration::from_secs(state.config().routing.attempt_timeout_secs.max(1));
             let exec_result = tokio::time::timeout(attempt_timeout, provider.execute(&request, &candidate.model)).await;
 
             match exec_result {
@@ -335,7 +335,7 @@ async fn dispatch(
                         attempt_number,
                         state.telemetry_tx.clone(),
                         state.telemetry_health.clone(),
-                        state.config.telemetry.store_stream_events,
+                        state.config().telemetry.store_stream_events,
                         !request.stream,
                     );
 
@@ -347,9 +347,9 @@ async fn dispatch(
                         // already started receiving.
                         let mut instrumented = Box::pin(instrumented);
                         let mut replay = Vec::new();
-                        if state.config.routing.stream_failover {
+                        if state.config().routing.stream_failover {
                             let first_token_timeout = state
-                                .config
+                                .config()
                                 .routing
                                 .first_token_timeout_secs
                                 .map(std::time::Duration::from_secs);
@@ -779,7 +779,7 @@ async fn dispatch(
 
                 Err(_elapsed) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
-                    let err_msg = format!("Attempt timed out after {}s", state.config.routing.attempt_timeout_secs);
+                    let err_msg = format!("Attempt timed out after {}s", state.config().routing.attempt_timeout_secs);
                     last_error = Some(err_msg.clone());
 
                     state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {
@@ -1085,7 +1085,7 @@ pub(crate) async fn pace_retry(
     retry_after_ms: Option<u64>,
 ) -> bool {
     note_retry_after(state, provider, retry_after_ms);
-    let max_ms = state.config.routing.max_retry_after_secs.saturating_mul(1000);
+    let max_ms = state.config().routing.max_retry_after_secs.saturating_mul(1000);
     match fallback::backoff_delay(retry_config, attempt, retry_after_ms, max_ms, fallback::jitter_sample()) {
         fallback::Backoff::Wait(delay) => {
             tokio::time::sleep(delay).await;

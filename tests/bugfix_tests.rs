@@ -173,7 +173,7 @@ async fn test_models_endpoint_namespacing() {
     let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(100);
 
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry,
         provider_registry,
         router,
@@ -183,6 +183,7 @@ async fn test_models_endpoint_namespacing() {
         telemetry_health: std::sync::Arc::new(ai_gateway::telemetry::TelemetryHealth::new(ai_gateway::telemetry::TelemetryMode::Disabled)),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
 

@@ -16,7 +16,7 @@ use tower::ServiceExt;
 
 fn state_with(manager: Option<LlamaServerManager>) -> Arc<AppState> {
     Arc::new(AppState {
-        config: GatewayConfig::load(None).unwrap(),
+        config: GatewayConfig::load(None).unwrap().into(),
         model_registry: ModelRegistry::new(Default::default()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -28,6 +28,7 @@ fn state_with(manager: Option<LlamaServerManager>) -> Arc<AppState> {
         )),
         response_cache: None,
         llama_server: manager.map(Arc::new),
+        reloader: None,
         analytics_pool: None,
     })
 }

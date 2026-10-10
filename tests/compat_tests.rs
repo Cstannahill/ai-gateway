@@ -115,7 +115,7 @@ fn gateway(base_url: &str, provider_extra: &str, tune: impl FnOnce(&mut GatewayC
     let (telemetry_tx, rx) = tokio::sync::mpsc::channel(1000);
     std::mem::forget(rx); // keep the channel open for the test's lifetime
     let state = Arc::new(AppState {
-        config,
+        config: config.into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry,
         router: RoutingEngine::new("priority".to_string()),
@@ -127,6 +127,7 @@ fn gateway(base_url: &str, provider_extra: &str, tune: impl FnOnce(&mut GatewayC
         )),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
     build_router(state)

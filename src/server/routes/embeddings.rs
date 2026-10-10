@@ -91,9 +91,9 @@ pub async fn handle(
     // untelemetered execution path (docs/REMEDIATION_PLAN.md Phase 1.1/2.4 —
     // Audit A14).
     let retry_config = fallback::RetryConfig {
-        max_attempts_per_provider: state.config.routing.max_retries_per_provider,
+        max_attempts_per_provider: state.config().routing.max_retries_per_provider,
         fallback_on: state
-            .config
+            .config()
             .routing
             .fallback_on
             .iter()
@@ -108,8 +108,8 @@ pub async fn handle(
             .collect(),
         ..Default::default()
     };
-    let max_retries = state.config.routing.max_retries_per_provider.max(1);
-    let attempt_timeout = std::time::Duration::from_secs(state.config.routing.attempt_timeout_secs.max(1));
+    let max_retries = state.config().routing.max_retries_per_provider.max(1);
+    let attempt_timeout = std::time::Duration::from_secs(state.config().routing.attempt_timeout_secs.max(1));
 
     let mut last_error = None;
     let mut attempt_number = 0u32;
@@ -237,7 +237,7 @@ pub async fn handle(
                 }
                 Err(_elapsed) => {
                     state.provider_registry.record_request_end(&candidate.provider, true);
-                    let err_msg = format!("Attempt timed out after {}s", state.config.routing.attempt_timeout_secs);
+                    let err_msg = format!("Attempt timed out after {}s", state.config().routing.attempt_timeout_secs);
                     last_error = Some(err_msg.clone());
 
                     state.emit_telemetry(TelemetryEvent::ProviderAttemptCompleted {

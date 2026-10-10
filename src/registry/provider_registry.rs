@@ -34,7 +34,7 @@ enum CircuitState {
 
 pub struct ProviderRegistry {
     /// Provider name → adapter instance.
-    providers: HashMap<String, Arc<dyn Provider>>,
+    providers: std::sync::RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Provider name → runtime state (health, counters).
     state: DashMap<String, ProviderRuntimeState>,
 }
@@ -68,6 +68,35 @@ struct ProviderRuntimeState {
     /// cumulative since startup and would make one bad hour on a
     /// long-running gateway invisible a week later.
     recent_outcomes: std::collections::VecDeque<bool>,
+}
+
+impl ProviderRuntimeState {
+    fn new(config: ProviderConfig) -> Self {
+        Self {
+            config,
+            health: ProviderHealth::Unknown,
+            active_requests: 0,
+            total_requests: 0,
+            total_errors: 0,
+            total_latency_ms: 0,
+            latency_samples: 0,
+            total_health_check_latency_ms: 0,
+            health_check_latency_samples: 0,
+            circuit_state: CircuitState::Closed,
+            consecutive_failures: 0,
+            rate_limit_window: (Instant::now(), 0),
+            cooldown_until: None,
+            recent_outcomes: std::collections::VecDeque::with_capacity(RECENT_OUTCOMES_CAPACITY),
+        }
+    }
+}
+
+/// What [`ProviderRegistry::reconcile`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    pub added: Vec<String>,
+    pub updated: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 /// How many recent attempt outcomes `effective_health_of` considers.
@@ -117,7 +146,7 @@ impl Default for ProviderRegistry {
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
-            providers: HashMap::new(),
+            providers: std::sync::RwLock::new(HashMap::new()),
             state: DashMap::new(),
         }
     }
@@ -129,42 +158,81 @@ impl ProviderRegistry {
         adapter: Arc<dyn Provider>,
     ) {
         let name = config.name.clone();
-        self.state.insert(
-            name.clone(),
-            ProviderRuntimeState {
-                config,
-                health: ProviderHealth::Unknown,
-                active_requests: 0,
-                total_requests: 0,
-                total_errors: 0,
-                total_latency_ms: 0,
-                latency_samples: 0,
-                total_health_check_latency_ms: 0,
-                health_check_latency_samples: 0,
-                circuit_state: CircuitState::Closed,
-                consecutive_failures: 0,
-                rate_limit_window: (Instant::now(), 0),
-                cooldown_until: None,
-                recent_outcomes: std::collections::VecDeque::with_capacity(RECENT_OUTCOMES_CAPACITY),
-            },
-        );
-        self.providers.insert(name, adapter);
+        self.state.insert(name.clone(), ProviderRuntimeState::new(config));
+        self.providers.get_mut().unwrap().insert(name, adapter);
+    }
+
+    /// Bring the registry in line with a reloaded configuration, keeping the
+    /// runtime state (counters, circuit breaker, cooldown, in-flight accounting)
+    /// of every provider that survives. `desired` lists each provider that
+    /// should exist; an adapter is supplied only for providers that are new or
+    /// whose configuration changed (`None` = keep the running adapter as is).
+    /// A provider whose adapter is replaced has its health reset to `Unknown`
+    /// so the next health tick re-checks it. Providers not in `desired` are
+    /// removed; requests already holding their adapter finish normally.
+    pub fn reconcile(
+        &self,
+        desired: Vec<(ProviderConfig, Option<Arc<dyn Provider>>)>,
+    ) -> ReconcileSummary {
+        let mut summary = ReconcileSummary::default();
+        let mut providers = self.providers.write().unwrap();
+        let wanted: std::collections::HashSet<String> =
+            desired.iter().map(|(c, _)| c.name.clone()).collect();
+
+        for (config, adapter) in desired {
+            let name = config.name.clone();
+            match (self.state.get_mut(&name), adapter) {
+                (Some(mut existing), Some(adapter)) => {
+                    existing.config = config;
+                    existing.health = ProviderHealth::Unknown;
+                    providers.insert(name.clone(), adapter);
+                    summary.updated.push(name);
+                }
+                (Some(_), None) => {}
+                (None, Some(adapter)) => {
+                    self.state.insert(name.clone(), ProviderRuntimeState::new(config));
+                    providers.insert(name.clone(), adapter);
+                    summary.added.push(name);
+                }
+                (None, None) => {
+                    // Nothing to run and nothing registered: a caller bug; skip.
+                    tracing::warn!(provider = %name, "reconcile: new provider without an adapter ignored");
+                }
+            }
+        }
+
+        let gone: Vec<String> = providers
+            .keys()
+            .filter(|n| !wanted.contains(*n))
+            .cloned()
+            .collect();
+        for name in gone {
+            providers.remove(&name);
+            self.state.remove(&name);
+            summary.removed.push(name);
+        }
+        summary.added.sort();
+        summary.updated.sort();
+        summary.removed.sort();
+        summary
     }
 
     /// Get a provider adapter by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Provider>> {
-        self.providers.get(name).cloned()
+        self.providers.read().unwrap().get(name).cloned()
     }
 
     /// Get all provider names.
     #[allow(dead_code)]
     pub fn provider_names(&self) -> Vec<String> {
-        self.providers.keys().cloned().collect()
+        self.providers.read().unwrap().keys().cloned().collect()
     }
 
     /// Get all provider adapter instances with their names.
     pub fn all_adapters(&self) -> Vec<(String, Arc<dyn Provider>)> {
         self.providers
+            .read()
+            .unwrap()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()

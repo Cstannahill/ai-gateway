@@ -17,7 +17,7 @@ use ai_gateway::server::{AppState, build_router};
 async fn get(path: &str) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
     let (telemetry_tx, _rx) = tokio::sync::mpsc::channel(10);
     let state = Arc::new(AppState {
-        config: GatewayConfig::load(None).unwrap(),
+        config: GatewayConfig::load(None).unwrap().into(),
         model_registry: ModelRegistry::new(HashMap::new()),
         provider_registry: ProviderRegistry::new(),
         router: RoutingEngine::new("priority".to_string()),
@@ -29,6 +29,7 @@ async fn get(path: &str) -> (StatusCode, Option<String>, Option<String>, Vec<u8>
         )),
         response_cache: None,
         llama_server: None,
+        reloader: None,
         analytics_pool: None,
     });
     let response = build_router(state)

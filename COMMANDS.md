@@ -272,6 +272,10 @@ Default base URL `http://127.0.0.1:8999`. Bodies and responses are documented in
 | `GET` | `/providers` | Provider health, circuit state, in-flight counts. |
 | `GET` | `/metrics` | Metrics snapshot. |
 | `GET` | `/favicon.ico`, `/icon.png` | The application icon (embedded in the binary). |
+| `POST` | `/admin/reload` | Re-read `gateway.yaml` and the env file and apply them without a restart (see below). Loopback callers only; refused for browser origins. |
+| `GET` | `/admin/reload` | Reload status: watched files, reloads applied, outcome of the last attempt. |
+
+**Reloading configuration.** The gateway re-reads its config file (and the env file) when either changes on disk (checked every 2 s, applied once the file has stopped changing) or when `POST /admin/reload` is called. Reloaded: `providers`, `models`, `routing`. Reported as "restart required" and left as running: `server`, `telemetry`, `pricing`, `caching`, `llama_server`. A file that fails to parse or validate is rejected whole - the running configuration is unchanged and the endpoint answers `422` with the reason. In-flight requests finish on the configuration they started with. Details: `docs/CONFIGURATION_GUIDE.md` section 5.
 
 **Analytics** (read-only; `503` when no database is configured)
 

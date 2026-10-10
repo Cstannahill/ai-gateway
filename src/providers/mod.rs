@@ -90,6 +90,27 @@ pub trait Provider: Send + Sync {
 /// Construct the adapter for a configured provider. Shared by `main.rs` and
 /// the opt-in live smoke tests (`tests/live_provider_smoke_tests.rs`) so the
 /// tests exercise exactly the construction path production uses.
+/// [`build_adapter`] plus the llama-server link: the provider that talks to the
+/// managed llama-server also lists the saved models and loads the requested one
+/// on demand. Used at startup and by config reload, so both build the same thing.
+pub fn build_registered_adapter(
+    config: &crate::types::ProviderConfig,
+    llama: Option<&std::sync::Arc<crate::llama_server::LlamaServerManager>>,
+) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
+    let mut adapter = build_adapter(config)?;
+    if let Some(manager) = llama
+        && manager.config().provider.as_deref() == Some(config.name.as_str())
+    {
+        adapter = std::sync::Arc::new(llama_managed::ManagedLlamaProvider::new(adapter, manager.clone()));
+        tracing::info!(
+            provider = %config.name,
+            auto_swap = manager.config().auto_swap,
+            "Provider is backed by the managed llama-server"
+        );
+    }
+    Ok(adapter)
+}
+
 pub fn build_adapter(config: &crate::types::ProviderConfig) -> anyhow::Result<std::sync::Arc<dyn Provider>> {
     use crate::types::{ModelCapabilities, ProviderType};
     use std::sync::Arc;
