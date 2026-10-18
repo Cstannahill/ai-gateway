@@ -2,17 +2,17 @@
 
 AI Gateway is a personal Rust reverse proxy that presents multiple local and hosted language-model providers through OpenAI-compatible HTTP endpoints. It resolves model aliases, filters and orders provider candidates, retries eligible failures, and can record request and streaming telemetry asynchronously.
 
-It is designed for a trusted, personal deployment—not as a multi-tenant service. The gateway does not provide user authentication. Bind it to loopback or place it behind a separately secured network boundary.
+It is designed for a trusted, personal deployment—not as a multi-tenant service—and does not provide user authentication. The built-in server default binds to `0.0.0.0:8999` (all interfaces). Set `server.host: "127.0.0.1"` for local-only use, or place it behind a separately secured network boundary before exposing it to other machines.
 
 ## What it does
 
 - Exposes chat completions, legacy completions, responses, embeddings, and model-list endpoints.
-- Supports configured provider adapters for llama.cpp, vLLM, Ollama, Ollama Cloud, OpenRouter, Gemini, Hugging Face, and generic OpenAI-compatible services.
+- Includes dedicated adapters for llama.cpp, vLLM, Ollama, Ollama Cloud, OpenRouter, Gemini, and Hugging Face, plus a generic OpenAI-compatible adapter. The configured xAI, Venice.ai, and Featherless.ai provider types currently use that generic adapter rather than dedicated implementations.
 - Routes logical model aliases to ordered candidates; explicit `provider/model` addressing selects one configured provider/model directly.
 - Retries eligible provider failures and can fail over to the next candidate. Streaming requests can hold the response until the first output so pre-output failures can fail over.
 - Re-serializes provider streams as OpenAI-style server-sent events and emits telemetry through a bounded, non-blocking channel.
 - Optionally writes telemetry to PostgreSQL. When a database is unavailable, the gateway can continue without persistent telemetry; analytics endpoints require a reachable database.
-- Optionally manages a local `llama-server` process and saved models. This feature is disabled unless configured and is restricted by loopback and browser-origin/host guards.
+- Optionally manages a local `llama-server` process and saved models. This feature is disabled unless configured and, by default, requires a loopback gateway bind and applies browser-origin/host guards.
 - Provides health, provider, gateway metrics, Prometheus, admin reload, analytics, and (when enabled) llama-server management endpoints.
 
 ## Requirements
@@ -59,7 +59,7 @@ Use `http://127.0.0.1:8999/v1` as the base URL in OpenAI-compatible clients. The
 | `POST /v1/completions` | Text completions |
 | `POST /v1/responses` | Responses API |
 | `POST /v1/embeddings` | Embeddings |
-| `GET /v1/models` | Configured model list |
+| `GET /v1/models` | Configured and provider-discovered model catalog |
 | `GET /health` | Provider health summary |
 | `GET /providers` | Provider status |
 | `GET /metrics` | Gateway metrics |
@@ -69,6 +69,21 @@ Use `http://127.0.0.1:8999/v1` as the base URL in OpenAI-compatible clients. The
 | `/llama-server/*` | Optional local llama-server controls, available only when configured |
 
 See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for request and response details and [`COMMANDS.md`](COMMANDS.md) for the full endpoint and command index.
+
+## Web console
+
+The repository also includes a Next.js console for chat, request and provider telemetry, model comparison, and optional llama-server management. It runs separately from the Rust gateway and connects through a same-origin server-side proxy; it does not need provider or database credentials.
+
+With Node.js 22.18+ and pnpm 10.11+:
+
+```bash
+cd frontend
+pnpm install --frozen-lockfile
+cp .env.example .env.local
+pnpm dev
+```
+
+Open `http://127.0.0.1:3000`. The default `GATEWAY_URL` is `http://127.0.0.1:8999`; see [`frontend/README.md`](frontend/README.md) for setup, console behavior, and frontend verification commands.
 
 ## Configuration and routing
 
@@ -111,6 +126,7 @@ src/
 ├── server/       Axum routes, middleware, and application state
 ├── telemetry/    Event instrumentation and asynchronous persistence
 └── llama_server/ Optional local process manager
+frontend/          Next.js console
 migrations/       PostgreSQL schema migrations
 tests/            Unit and integration test targets
 ```
