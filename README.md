@@ -1,229 +1,129 @@
 # AI Gateway
 
-<div align="center">
+AI Gateway is a personal Rust reverse proxy that presents multiple local and hosted language-model providers through OpenAI-compatible HTTP endpoints. It resolves model aliases, filters and orders provider candidates, retries eligible failures, and can record request and streaming telemetry asynchronously.
 
-<img src="AI-Gateway.png" alt="AI Gateway" width="128">
+It is designed for a trusted, personal deployment—not as a multi-tenant service. The gateway does not provide user authentication. Bind it to loopback or place it behind a separately secured network boundary.
 
-**A high-performance personal LLM inference gateway with first-class telemetry, intelligent routing, and multi-provider failover.**
+## What it does
 
-[![Language](https://img.shields.io/badge/language-Rust_2024-orange.svg)](https://www.rust-lang.org/)
-[![Framework](https://img.shields.io/badge/framework-Axum_0.8-blue.svg)](https://github.com/tokio-rs/axum)
-[![Database](https://img.shields.io/badge/database-PostgreSQL_16-blue.svg)](https://www.postgresql.org/)
-[![Tests](https://img.shields.io/badge/tests-58%2F58_passed-brightgreen.svg)]()
-[![Warnings](https://img.shields.io/badge/warnings-0-brightgreen.svg)]()
+- Exposes chat completions, legacy completions, responses, embeddings, and model-list endpoints.
+- Supports configured provider adapters for llama.cpp, vLLM, Ollama, Ollama Cloud, OpenRouter, Gemini, Hugging Face, and generic OpenAI-compatible services.
+- Routes logical model aliases to ordered candidates; explicit `provider/model` addressing selects one configured provider/model directly.
+- Retries eligible provider failures and can fail over to the next candidate. Streaming requests can hold the response until the first output so pre-output failures can fail over.
+- Re-serializes provider streams as OpenAI-style server-sent events and emits telemetry through a bounded, non-blocking channel.
+- Optionally writes telemetry to PostgreSQL. When a database is unavailable, the gateway can continue without persistent telemetry; analytics endpoints require a reachable database.
+- Optionally manages a local `llama-server` process and saved models. This feature is disabled unless configured and is restricted by loopback and browser-origin/host guards.
+- Provides health, provider, gateway metrics, Prometheus, admin reload, analytics, and (when enabled) llama-server management endpoints.
 
-</div>
+## Requirements
 
----
+- Rust 1.88 or newer (edition 2024).
+- PostgreSQL only if persistent telemetry or the analytics API is needed.
+- One or more inference providers configured in `config/gateway.yaml`.
 
-## Overview
+## Quick start
 
-Modern LLM workflows rarely depend on a single model or provider. A developer typically relies on a heterogeneous inference stack:
-- **Local GPUs**: `llama-server` (llama.cpp) or `vLLM` for fast, private, zero-marginal-cost coding and completions.
-- **Local Services**: `Ollama` for simple command-line model management.
-- **Cloud Aggregators**: `OpenRouter` for cost-effective fallback to hundreds of open-weights and proprietary models.
-- **Direct Frontier APIs**: `Google Gemini`, `Anthropic`, `OpenAI`, or `Hugging Face`.
+1. Review [`config/gateway.yaml`](config/gateway.yaml) and add the providers and model aliases you intend to use. The checked-in file is an example, not a portable deployment configuration.
+2. Set any provider API keys named by `api_key_env` and, if desired, `DATABASE_URL`. You can put local values in a `.env` file in the working directory; real environment variables take precedence. See [`.env.example`](.env.example).
+3. Start the gateway:
 
-**AI Gateway** is a personal, low-latency reverse proxy written in Rust that unifies all these backends behind standard OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`).
+   ```bash
+   cargo run --release
+   ```
 
-Instead of hardcoding provider endpoints and API keys into dozens of local tools, editors, and scripts, point all applications to:
-```text
-http://localhost:8999/v1
-```
+   By default it listens on port `8999`. Configuration resolution is: CLI config path, `config/gateway.yaml`, `gateway.yaml`, then built-in defaults. To choose a config explicitly:
 
-```mermaid
-graph TD
-    Client[Your Tools & Applications<br/>Cursor, Cline, Aider, LangChain, cURL] -->|OpenAI Protocol| Gateway[AI Gateway :8999]
+   ```bash
+   cargo run --release -- path/to/config.yaml
+   ```
 
-    subgraph "AI Gateway Core Engine"
-        Gateway --> Router[Routing & Policy Engine]
-        Router --> Registry[Model & Provider Registry]
-        Router --> Fallback[Retry & Fallback Manager]
-        Gateway --> StreamInst[Zero-Cost Streaming Instrumentation]
-        StreamInst --> TelemQueue[Non-Blocking Bounded Channel]
-    end
+4. Send a request using an alias defined in your configuration:
 
-    Router --> Llama[llama-server / llama.cpp]
-    Router --> OpenRouter[OpenRouter Cloud]
-    Router --> Vllm[vLLM Inference]
-    Router --> Ollama[Ollama / Ollama Cloud]
-    Router --> Gemini[Google Gemini AI]
-    Router --> HF[Hugging Face API]
+   ```bash
+   curl http://127.0.0.1:8999/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "model": "coding-fast",
+       "messages": [{"role": "user", "content": "Explain Rust ownership briefly."}],
+       "stream": false
+     }'
+   ```
 
-    TelemQueue --> BatchWriter[Background Batch Writer]
-    BatchWriter --> Postgres[(PostgreSQL Database<br/>12 Relational Tables)]
-```
+Use `http://127.0.0.1:8999/v1` as the base URL in OpenAI-compatible clients. The alias above is present in the sample configuration; change it to an alias you have configured.
 
----
+## API overview
 
-## Key Features
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | Chat completions, including streaming |
+| `POST /v1/completions` | Text completions |
+| `POST /v1/responses` | Responses API |
+| `POST /v1/embeddings` | Embeddings |
+| `GET /v1/models` | Configured model list |
+| `GET /health` | Provider health summary |
+| `GET /providers` | Provider status |
+| `GET /metrics` | Gateway metrics |
+| `GET /metrics/prometheus` | Prometheus exposition endpoint |
+| `/v1/analytics/*` | Read-only telemetry queries; returns unavailable when no analytics database pool is configured |
+| `/admin/reload` | Configuration reload status (`GET`) and reload (`POST`) |
+| `/llama-server/*` | Optional local llama-server controls, available only when configured |
 
-- **Protocol Compatibility**: Full drop-in replacement for OpenAI endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`).
-- **Standard SSE Streaming**: Envelopes each chunk with standard OpenAI root fields (`id`, `object`, `created`, `model`, `choices`), terminates properly with `data: [DONE]`, and calculates streaming latencies without buffering delays.
-- **Dual Addressing Modes**:
-  - **Logical Aliases** (`coding-fast`, `coding-strong`): Decouples client tools from specific model versions, prioritizing local inference with automatic cloud failover.
-  - **Explicit Addressing** (`openrouter/anthropic/claude-3.5-sonnet`): Guarantees exact model execution for reproducibility.
-- **80/20 Schema Normalization + Escape Hatches**: Normalized core schema combined with unconstrained `provider_options` pass-throughs for vendor-specific parameters (`min_p`, `repeat_penalty`, `top_k`, `guided_json`, `thinkingConfig`).
-- **Non-Streaming Tool Call & Reasoning Accumulation**: Transparently reconstructs multi-chunk tool calls and reasoning outputs (`reasoning_content`) into single responses.
-- **First-Class Relational Telemetry**: Asynchronous, non-blocking telemetry writes across **12 PostgreSQL tables**, tracking request parameters, routing reasons, candidate attempts, chunk timelines, token counts, and costs.
-- **Log-Only Fallback**: Gracefully operates even if PostgreSQL is offline or unconfigured.
-- **Active Health Monitoring**: Background worker continuously verifies provider readiness and latency every 30 seconds.
-- **Production-Grade Middleware**: Mounted Tower HTTP middleware stack with CORS, tracing, monotonic UUIDv7 request ID propagation, and payload size limiting.
+See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for request and response details and [`COMMANDS.md`](COMMANDS.md) for the full endpoint and command index.
 
----
+## Configuration and routing
 
-## Quickstart
+Provider definitions specify adapter type, base URL, timeout, and—when needed—the environment variable containing the provider key. Model aliases contain one or more provider/model candidates with priorities and declared capabilities. The router applies availability and capability checks before ordering candidates according to the configured routing policy.
 
-### 1. Prerequisites
-- **Rust Toolchain**: 1.88+ (Edition 2024; the codebase uses let-chain syntax stabilized in 1.88 — an older toolchain will fail to compile despite the Edition 2024 minimum implying 1.85).
-- **PostgreSQL** *(Optional)*: Required for persistent telemetry and dataset generation.
+For example, a logical alias can prefer a local provider and list a hosted provider as a later candidate. Explicit addressing such as `openrouter/vendor/model-name` bypasses alias candidate selection and targets that provider/model. Retry limits, eligible fallback errors, stream preflight, and other settings are documented in [`docs/CONFIGURATION_GUIDE.md`](docs/CONFIGURATION_GUIDE.md) and [`docs/ROUTING_AND_POLICIES.md`](docs/ROUTING_AND_POLICIES.md).
 
-### 2. Configuration
-Copy or edit [`config/gateway.yaml`](file:///s:/Code/RustProjects/AI-Gateway/config/gateway.yaml):
+Configuration and `.env` changes can be reloaded through the admin endpoint when reload support is active. Some settings—including the server bind, telemetry, pricing, caching, and llama-server manager—require a restart. See the configuration guide before relying on hot reload for a particular setting.
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8999
+## Telemetry and optional features
 
-providers:
-  llama:
-    name: "llama"
-    type: "llama_cpp"
-    base_url: "http://localhost:8080"
-    timeout_secs: 300
+Telemetry is sent to a bounded queue so database writes do not block the response path. The background writer batches PostgreSQL writes and has a JSONL fallback for persistent-write failures. PostgreSQL-backed analytics are read-only; with no database available at startup, the analytics routes return `503`.
 
-  openrouter:
-    name: "openrouter"
-    type: "open_router"
-    base_url: "https://openrouter.ai/api"
-    api_key_env: "OPENROUTER_API_KEY"
-    timeout_secs: 120
+The response cache is optional and disabled by default. It caches exact matches for non-streaming chat completions. The optional llama-server manager can scan and save local models, start/stop the process, and switch the linked provider to a requested saved model; enabling it executes a local binary, so review its security and loopback requirements in the configuration guide.
 
-models:
-  coding-fast:
-    description: "Local coding with cloud fallback"
-    candidates:
-      - provider: "llama"
-        model: "qwen3.5-9b"
-        priority: 1
-      - provider: "openrouter"
-        model: "qwen/qwen-2.5-coder-32b-instruct"
-        priority: 2
-    capabilities:
-      tools: true
-      streaming: true
-
-telemetry:
-  enabled: true
-  database_url_env: "DATABASE_URL"
-```
-
-### 3. Build & Run
-```bash
-# Set your environment variables
-export DATABASE_URL="postgres://postgres:password@localhost:5432/ai_gateway"
-export OPENROUTER_API_KEY="sk-or-v1-..."
-
-# Run the server
-cargo run --release
-```
-
-The gateway starts at `http://localhost:8999`.
-
-### 4. Send Your First Request
-```bash
-curl -X POST http://localhost:8999/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "coding-fast",
-    "messages": [
-      {"role": "user", "content": "Write a quicksort in Rust"}
-    ],
-    "stream": true
-  }'
-```
-
----
-
-## Project Structure
-
-```text
-ai-gateway/
-├── Cargo.toml               # Package definition (Axum 0.8, Tokio, SQLx, Tower)
-├── config/
-│   └── gateway.yaml         # Server, provider, model, routing, & telemetry config
-├── migrations/
-│   └── 001_initial_schema.sql # 12-table PostgreSQL schema with UUIDv7
-├── src/
-│   ├── lib.rs               # Library root (exports all gateway subsystems)
-│   ├── main.rs              # Application entry point & health check daemon
-│   ├── config/              # Configuration parser & validation
-│   ├── types/               # Canonical domain models (Request, Response, Model)
-│   ├── registry/            # Model and Provider catalogs & runtime state
-│   ├── routing/             # 6-stage routing pipeline & fallback manager
-│   ├── providers/           # Adapter layer (llama.cpp, vLLM, OpenRouter, etc.)
-│   ├── server/              # Axum HTTP routes, SSE generator, & middleware
-│   └── telemetry/           # Asynchronous PostgreSQL batch persistence engine
-├── tests/                   # Integration test suites
-│   ├── api_tests.rs         # Endpoints verification (/health, /metrics, etc.)
-│   ├── routing_tests.rs     # Capability, priority, & alias resolution tests
-│   ├── fallback_tests.rs    # Error trigger & fallback policy tests
-│   ├── provider_options_tests.rs # Vendor parameter enrichment tests
-│   └── sse_tests.rs         # SSE chunk formatting & protocol tests
-└── docs/                    # Detailed technical documentation
-    ├── ARCHITECTURE.md
-    ├── ROUTING_AND_POLICIES.md
-    ├── TELEMETRY_AND_DATABASE.md
-    ├── CONFIGURATION_GUIDE.md
-    ├── PROVIDER_INTEGRATION_GUIDE.md
-    └── API_REFERENCE.md
-```
-
----
-
-## Detailed Documentation Index
-
-For in-depth guides, architectural references, and implementation specifics, explore the [`docs/`](file:///s:/Code/RustProjects/AI-Gateway/docs) directory:
-
-1. [**System Architecture & Design Principles**](docs/ARCHITECTURE.md):
-   Dual-layer architecture, canonical domain models, memory efficiency, and the complete request lifecycle.
-2. [**Routing Engine & Policy Architecture**](docs/ROUTING_AND_POLICIES.md):
-   Logical aliases vs explicit addressing, capability matching (vision/tools), routing policies, and fallback/retry rules.
-3. [**Telemetry Architecture & Database Schema**](docs/TELEMETRY_AND_DATABASE.md):
-   The 12 relational database tables, streaming metrics (TTFT, TPS, jitter), async batching pipeline, and dataset export queries.
-4. [**Configuration Guide**](docs/CONFIGURATION_GUIDE.md):
-   Exhaustive reference for every parameter in `config/gateway.yaml` with types, defaults, and examples.
-5. [**Provider Integration & Escape Hatch Guide**](docs/PROVIDER_INTEGRATION_GUIDE.md):
-   Configuration and parameter escape hatches for llama.cpp, OpenRouter, vLLM, Gemini, Ollama, and instructions for adding new adapters.
-6. [**HTTP API Reference**](docs/API_REFERENCE.md):
-   Full specification with cURL examples and JSON schemas for `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models`, `/health`, `/metrics`, and `/providers`.
-
----
-
-## Verification & Testing
-
-The gateway includes an extensive automated integration test suite:
+## Development and tests
 
 ```bash
-# Run all integration test suites across all targets
-cargo test --all-targets
-
-# Verify code compilation with zero warnings
 cargo check --all-targets
+cargo test --all-targets
 ```
 
-### Test Results
-- `unittests src/lib.rs`: **PASSED**
-- `unittests src/main.rs`: **PASSED**
-- `tests/api_tests.rs`: **PASSED** (6/6)
-- `tests/audit_contract_tests.rs`: **PASSED** (14/14, 1 ignored — requires a live disposable PostgreSQL instance; see the file's own doc comment)
-- `tests/bugfix_tests.rs`: **PASSED** (7/7)
-- `tests/config_validation_tests.rs`: **PASSED** (12/12)
-- `tests/fallback_tests.rs`: **PASSED** (3/3)
-- `tests/provider_options_tests.rs`: **PASSED** (3/3)
-- `tests/routing_tests.rs`: **PASSED** (6/6)
-- `tests/sse_tests.rs`: **PASSED** (7/7)
-- **Compiler Warnings**: **0 warnings** across all crates and tests.
+Most tests do not require PostgreSQL. A small set of database verification and analytics tests only exercise their database paths when `AUDIT_DATABASE_URL` points to a disposable PostgreSQL database; otherwise they degrade to a no-op. To run those database paths:
 
-See [`docs/INIT_CONVERSATION_AUDIT.md`](docs/INIT_CONVERSATION_AUDIT.md), [`docs/INIT_CONVERSATION_AUDIT_CLAUDE.md`](docs/INIT_CONVERSATION_AUDIT_CLAUDE.md), and [`docs/REMEDIATION_PLAN.md`](docs/REMEDIATION_PLAN.md) for a detailed, code-verified account of what is and isn't yet implemented — passing tests confirm the behavior they cover, not full API compatibility.
+```bash
+AUDIT_DATABASE_URL="$YOUR_DISPOSABLE_POSTGRES_URL" cargo test --all-targets
+```
+
+Opt-in provider smoke tests and the real llama-server integration test have separate environment requirements; see [`docs/PROVIDER_INTEGRATION_GUIDE.md`](docs/PROVIDER_INTEGRATION_GUIDE.md) and the headers of the relevant tests.
+
+## Project map
+
+```text
+src/
+├── config/       YAML loading, validation, and environment overlay
+├── types/        Canonical request, response, model, and provider types
+├── registry/     Model aliases and live provider state
+├── routing/      Candidate selection, policies, retries, and failover
+├── providers/    Provider trait and backend adapters
+├── server/       Axum routes, middleware, and application state
+├── telemetry/    Event instrumentation and asynchronous persistence
+└── llama_server/ Optional local process manager
+migrations/       PostgreSQL schema migrations
+tests/            Unit and integration test targets
+```
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Routing and policies](docs/ROUTING_AND_POLICIES.md)
+- [Telemetry and database](docs/TELEMETRY_AND_DATABASE.md)
+- [Configuration](docs/CONFIGURATION_GUIDE.md)
+- [Provider integration](docs/PROVIDER_INTEGRATION_GUIDE.md)
+- [HTTP API reference](docs/API_REFERENCE.md)
+- [Commands, environment variables, and endpoint index](COMMANDS.md)
+- [Remediation status and verified limitations](docs/REMEDIATION_PLAN.md)
+
+The audit documents are historical snapshots. For current implementation status, consult the newest status block in [`docs/REMEDIATION_PLAN.md`](docs/REMEDIATION_PLAN.md).
