@@ -56,14 +56,14 @@ Use `http://127.0.0.1:8999/v1` as the base URL in OpenAI-compatible clients. The
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat/completions` | Chat completions, including streaming |
-| `POST /v1/completions` | Text completions |
+| `POST /v1/completions` | Raw-prompt (legacy) completions |
 | `POST /v1/responses` | Responses API |
 | `POST /v1/embeddings` | Embeddings |
 | `GET /v1/models` | Configured and provider-discovered model catalog |
 | `GET /health` | Provider health summary |
 | `GET /providers` | Provider status |
 | `GET /metrics` | Gateway metrics |
-| `GET /metrics/prometheus` | Prometheus exposition endpoint |
+| `GET /metrics/prometheus` | Prometheus exposition endpoint (same loopback/browser guard as admin routes) |
 | `/v1/analytics/*` | Read-only telemetry queries; returns unavailable when no analytics database pool is configured |
 | `/admin/reload` | Configuration reload status (`GET`) and reload (`POST`) |
 | `/llama-server/*` | Optional local llama-server controls, available only when configured |
@@ -118,11 +118,14 @@ Opt-in provider smoke tests and the real llama-server integration test have sepa
 
 ```text
 src/
+├── cache/        Exact-match response cache
+├── cli.rs        Command-line argument parsing and help
 ├── config/       YAML loading, validation, and environment overlay
 ├── types/        Canonical request, response, model, and provider types
 ├── registry/     Model aliases and live provider state
 ├── routing/      Candidate selection, policies, retries, and failover
 ├── providers/    Provider trait and backend adapters
+├── reload.rs     Configuration hot-reload coordination
 ├── server/       Axum routes, middleware, and application state
 ├── telemetry/    Event instrumentation and asynchronous persistence
 └── llama_server/ Optional local process manager
