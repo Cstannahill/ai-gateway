@@ -94,7 +94,7 @@ cargo test --all-targets
 Most tests do not require PostgreSQL. A small set of database verification and analytics tests only exercise their database paths when `AUDIT_DATABASE_URL` points to a disposable PostgreSQL database; otherwise they degrade to a no-op. To run those database paths:
 
 ```bash
-AUDIT_DATABASE_URL=******127.0.0.1:55432/DATABASE cargo test --all-targets
+AUDIT_DATABASE_URL="$YOUR_DISPOSABLE_POSTGRES_URL" cargo test --all-targets
 ```
 
 Opt-in provider smoke tests and the real llama-server integration test have separate environment requirements; see [`docs/PROVIDER_INTEGRATION_GUIDE.md`](docs/PROVIDER_INTEGRATION_GUIDE.md) and the headers of the relevant tests.
